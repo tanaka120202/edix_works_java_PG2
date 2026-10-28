@@ -17,8 +17,8 @@ import java.sql.Statement; // ★変更 テーブル作成のSQLを実行しま�
 import java.io.IOException; // ★変更 SQLエラーをWeb処理から伝えます。
 import java.util.List; // 複数のTodoを並べて持つ一覧を使います。
 import java.util.ArrayList; // Todo一覧を作るための機能を使います。
-import java.util.Map; // ★ ジャンルの番号と名前を対応させます。
-import java.util.LinkedHashMap; // ★ 読み込んだジャンルの順序を保ちます。
+import java.util.Map; // ★ カテゴリの番号と名前を対応させます。
+import java.util.LinkedHashMap; // ★ 読み込んだカテゴリの順序を保ちます。
 import java.util.concurrent.Executors; // ★ 定期的に自動削除を実行します。
 import java.util.concurrent.ScheduledExecutorService; // ★ 定期処理を動かすための標準機能です。
 import java.util.concurrent.TimeUnit; // ★ 定期処理の間隔を分で指定します。
@@ -75,7 +75,7 @@ public class App {
             if (path.equals("/add") && method.equals("POST")) {
                 // 送信された中身をUTF-8の文字として読み取ります。
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-                // ★ 複数の入力欄から、やることとジャンルを取り出します。
+                // ★ 複数の入力欄から、やることとカテゴリを取り出します。
                 String title = formValue(body, "todo");
                 try {
                     int genreId = readGenreId(formValue(body, "genre"));
@@ -100,7 +100,7 @@ public class App {
                 exchange.close();
                 // この分岐の処理を終えます。
                 return;
-                // ★ 自由な名前のジャンルを登録します。
+                // ★ 自由な名前のカテゴリを登録します。
             } else if (path.equals("/genres/add") && method.equals("POST")) {
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 String name = formValue(body, "name").strip();
@@ -138,7 +138,7 @@ public class App {
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
-                // ★ 既存Todoのジャンルを変更します。
+                // ★ 既存Todoのカテゴリを変更します。
             } else if (path.equals("/genre") && method.equals("POST")) {
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 try {
@@ -155,7 +155,7 @@ public class App {
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
-                // ★ ジャンルと同じように、場所・関係者・プロジェクトを登録します。
+                // ★ カテゴリと同じように、場所・関係者・プロジェクトを登録します。
             } else if (detailForPath(path, true) != null && method.equals("POST")) {
                 Detail detail = detailForPath(path, true);
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
@@ -276,7 +276,7 @@ public class App {
                 return;
                 // / を開いたら入力フォームとTodo一覧を表示します。
             } else if (path.equals("/")) {
-                // ★ ジャンルと絞り込み条件を読み込みます。
+                // ★ カテゴリと絞り込み条件を読み込みます。
                 Map<Integer, String> genres = loadGenres();
                 String filter = normalizedFilter(formValue(exchange.getRequestURI().getRawQuery(), "filter"));
                 if (!filter.isEmpty() && !filter.equals("none") && !genres.containsKey(Integer.parseInt(filter))) {
@@ -371,7 +371,7 @@ public class App {
         // ★ 指定フォントを読み込み、読み込めない場合は端末の標準フォントを使います。
         html += "<link rel='preconnect' href='https://fonts.googleapis.com'><link rel='preconnect' href='https://fonts.gstatic.com' crossorigin><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Noto+Sans+JP:wght@400;500;600&amp;display=swap' rel='stylesheet'><style>"
                 + pageStyles() + "</style></head><body><div class='workspace'>";
-        // ★ 左側には既存のジャンル絞り込みと登録フォームを縦に配置します。
+        // ★ 左側には既存のカテゴリ絞り込みと登録フォームを縦に配置します。
         html += "<aside class='sidebar'><div class='brand'>" + uiIcon("list")
                 + "<span>ToDoリスト</span></div><div class='sidebar-body'>";
         html += "<nav class='folder-navigation' aria-label='Todoのフォルダ'><a class='folder-link"
@@ -380,27 +380,27 @@ public class App {
                 + "Todo一覧</a><a class='folder-link" + (expiredFolder ? " is-selected" : "") + "'"
                 + (expiredFolder ? " aria-current='page'" : "") + " href='"
                 + escapeHtml(listLocation(filter, "expired", detailFilters, tagFilter)) + "'>" + uiIcon("folder") + "期限切れ</a></nav>";
-        html += "<nav class='sidebar-section' aria-label='一覧の絞り込み'><h2 class='section-label'>" + uiIcon("filter")
-                + "絞り込み</h2>";
-        html += "<form class='filter-form' method='get' action='/'><label class='field-label' for='genre-filter'>ジャンル</label><select id='genre-filter' name='filter' aria-label='表示するジャンル'><option value=''>すべて</option><option value='none'"
+        // ★ 既存の絞り込みは、ポップアップのフィルタータブへ移します。
+        html += "<div class='sidebar-section'><button type='button' class='button button-secondary filter-trigger' onclick=\"openOrganize('filter')\" aria-haspopup='dialog' aria-controls='organize-dialog'>"
+                + uiIcon("filter") + "フィルター</button></div>";
+        String filterForm = "<form id='list-filter-form' class='dialog-filter-form' method='get' action='/'><label class='field'><span class='field-label'>カテゴリ</span><select id='genre-filter' name='filter' aria-label='表示するカテゴリ'><option value=''>すべて</option><option value='none'"
                 + (filter.equals("none") ? " selected" : "") + ">未分類</option>";
         for (Map.Entry<Integer, String> genre : genres.entrySet()) {
-            html += "<option value='" + genre.getKey() + "'"
+            filterForm += "<option value='" + genre.getKey() + "'"
                     + (filter.equals(genre.getKey().toString()) ? " selected" : "") + ">" + escapeHtml(genre.getValue())
                     + "</option>";
         }
-        html += "</select>";
+        filterForm += "</select></label>";
         // ★ 新しい3項目も同じフォームで絞り込めます。条件はすべて同時に使えます。
         for (Detail detail : Detail.values()) {
-            html += detailFilterSelect(detail, details.get(detail), detailFilters.get(detail));
+            filterForm += "<div class='field'>" + detailFilterSelect(detail, details.get(detail), detailFilters.get(detail)) + "</div>";
         }
-        html += tagFilterSelect(tags, tagFilter);
-        html += "<input type='hidden' name='folder' value='" + folder
-                + "'><button class='button button-secondary'>絞り込む</button><a class='show-all' href='"
-                + escapeHtml(listLocation("", folder)) + "'>すべて表示</a></form></nav>";
-        html += "<section class='sidebar-section genre-registration'><h2 class='section-label'>ジャンルを登録</h2><form class='genre-form' method='post' action='/genres/add'><label class='field-label' for='new-genre'>ジャンル名</label><input id='new-genre' name='name' placeholder='仕事・家事など' required>"
+        filterForm += "<div class='field'>" + tagFilterSelect(tags, tagFilter) + "</div>";
+        filterForm += "<input type='hidden' name='folder' value='" + folder
+                + "'><a class='show-all' href='" + escapeHtml(listLocation("", folder)) + "'>すべて表示</a></form>";
+        html += "<section class='sidebar-section genre-registration'><h2 class='section-label'>カテゴリを登録</h2><form class='genre-form' method='post' action='/genres/add'><label class='field-label' for='new-genre'>カテゴリ名</label><input id='new-genre' name='name' placeholder='仕事・家事など' required>"
                 + hiddenFilter
-                + "<button class='button button-secondary'>ジャンルを登録</button></form></section>";
+                + "<button class='button button-secondary'>カテゴリを登録</button></form></section>";
         for (Detail detail : Detail.values()) {
             html += "<details class='sidebar-section detail-registration'><summary>" + detail.label
                     + "を登録</summary><form class='genre-form' method='post' action='/" + detail.table
@@ -424,7 +424,7 @@ public class App {
             List<Integer> selectedTags = tagFilter.isEmpty() || tagFilter.equals("none")
                     ? List.of() : List.of(Integer.parseInt(tagFilter));
             html += "<section class='add-section' aria-labelledby='add-heading'><h2 id='add-heading' class='small-heading'>Todoを追加</h2><form class='add-form' method='post' action='/add'><label class='field'><span class='field-label'>やること</span><input name='todo' placeholder='やることを入力'></label>"
-                    + tagCheckboxes(tags, selectedTags) + "<label class='field'><span class='field-label'>ジャンル</span>"
+                    + tagCheckboxes(tags, selectedTags) + "<label class='field'><span class='field-label'>カテゴリ</span>"
                     + genreSelect(genres, selectedGenre) + "</label>";
             for (Detail detail : Detail.values()) {
                 String selected = detailFilters.get(detail);
@@ -436,9 +436,10 @@ public class App {
                     + prioritySelect("中") + "</label>" + hiddenFilter
                     + "<button class='button button-primary'>" + uiIcon("plus") + "追加</button></form></section>";
         }
-        // ★ 並び替えボタンの操作はそのままに、選択状態を見分けられるようにします。
-        html += "<section class='list-section" + (expiredFolder ? " archived-list" : "") + "' aria-labelledby='list-heading'><div class='list-toolbar'><h2 id='list-heading'>一覧</h2><div class='sort-control' aria-label='期限の並び順'><button type='button' data-sort='asc' aria-pressed='true' onclick='sortTodos(false)'>期限が近い順</button><button type='button' data-sort='desc' aria-pressed='false' onclick='sortTodos(true)'>期限が遠い順</button></div></div>";
-        html += "<div class='column-headings' aria-hidden='true'><span>やること</span><span>ジャンル</span><span>重要度</span><span>期限</span><span class='actions-heading'>操作</span></div><ul id='todo-list' class='todo-list'>";
+        // ★ 一覧の並び替えは、ポップアップで選んで決定する形にします。
+        html += "<section class='list-section" + (expiredFolder ? " archived-list" : "") + "' aria-labelledby='list-heading'><div class='list-toolbar'><h2 id='list-heading'>一覧</h2><div class='list-order'><span id='current-sort' class='current-sort' aria-live='polite'>期限・昇順</span><button type='button' class='button button-secondary sort-trigger' onclick=\"openOrganize('sort')\" aria-haspopup='dialog' aria-controls='organize-dialog'>"
+                + uiIcon("sort") + "並び替え</button></div></div>";
+        html += "<div class='column-headings' aria-hidden='true'><span>やること</span><span>カテゴリ</span><span>重要度</span><span>期限</span><span class='actions-heading'>操作</span></div><ul id='todo-list' class='todo-list'>";
         if (todos.isEmpty()) {
             html += "<li class='empty-state'>"
                     + (expiredFolder ? "期限切れのTodoはありません"
@@ -448,7 +449,10 @@ public class App {
         } else {
             for (Todo todo : todos) {
                 String hiddenId = "<input type='hidden' name='id' value='" + todo.getId() + "'>";
-                html += "<li class='task-row' data-deadline='" + escapeHtml(todo.getDeadline())
+                // ★ 保存済みの値を並び替えに使います。入力途中のフォームはそのまま保持します。
+                html += "<li class='task-row' data-added='" + todo.getId() + "' data-deadline='" + escapeHtml(todo.getDeadline())
+                        + "' data-priority='" + escapeHtml(todo.getPriority())
+                        + "' data-category='" + escapeHtml(todo.getGenreId() == 0 ? "" : todo.getGenreName())
                         + "'><div class='task-title-box'><span class='task-title'>" + escapeHtml(todo.getTitle())
                         + "</span>" + (todo.isDone() ? "<span class='completion-mark'> ✔</span>" : "");
                 if (expiredFolder) {
@@ -459,10 +463,10 @@ public class App {
                             + "</span><span class='task-deadline archived-value'>" + escapeHtml(todo.getDeadline())
                             + "</span>";
                 } else {
-                    html += "</div><form class='task-field task-genre' method='post' action='/genre' aria-label='ジャンルの変更'>"
-                            + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>ジャンル</span>"
+                    html += "</div><form class='task-field task-genre' method='post' action='/genre' aria-label='カテゴリの変更'>"
+                            + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>カテゴリ</span>"
                             + genreSelect(genres, todo.getGenreId())
-                            + "</label><button class='save-button' aria-label='ジャンルを保存' title='ジャンルを保存'>保存</button></form>";
+                            + "</label><button class='save-button' aria-label='カテゴリを保存' title='カテゴリを保存'>保存</button></form>";
                     html += "<form class='task-field task-priority' method='post' action='/priority' aria-label='重要度の変更'>"
                             + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>重要度</span>"
                             + prioritySelect(todo.getPriority())
@@ -511,27 +515,148 @@ public class App {
             }
         }
         html += "</ul></section></div></main></div>";
-        // ★ 元の並び替えに、ボタンの選択表示だけを追加しています。
+        html += organizeDialog(filterForm) + organizeScript() + "</body></html>";
+        return html;
+    }
+
+    // ★ 画像の配置に合わせ、ソートとフィルターを一つのポップアップにまとめます。
+    static String organizeDialog(String filterForm) {
+        String html = """
+                <dialog id='organize-dialog' class='organize-dialog' aria-labelledby='organize-title'>
+                  <h2 id='organize-title' class='sr-only'>並び替えとフィルター</h2>
+                  <div class='organize-tabs' role='tablist' aria-label='一覧の表示設定'>
+                    <button type='button' id='sort-tab' role='tab' aria-selected='true' aria-controls='sort-panel' onclick="showOrganizeTab('sort')">ソート</button>
+                    <button type='button' id='filter-tab' role='tab' aria-selected='false' aria-controls='filter-panel' tabindex='-1' onclick="showOrganizeTab('filter')">フィルター</button>
+                  </div>
+                  <div id='sort-panel' class='organize-panel' role='tabpanel' aria-labelledby='sort-tab'>
+                    <fieldset class='sort-fieldset'><legend>並び替え</legend><div class='direction-options'>
+                """;
+        html += sortChoice("sortDirection", "desc", "降順", false)
+                + sortChoice("sortDirection", "asc", "昇順", true);
+        html += "</div></fieldset><fieldset class='sort-fieldset'><legend>基準</legend><div class='criteria-options'>";
+        String[][] criteria = {
+                { "added", "追加" }, { "deadline", "期限" }, { "category", "カテゴリ" },
+                { "priority", "重要度" }
+        };
+        for (String[] criterion : criteria) {
+            html += sortChoice("sortKey", criterion[0], criterion[1], criterion[0].equals("deadline"));
+        }
         html += """
-                <script>
-                function sortTodos(descending) {
-                    const list = document.getElementById('todo-list');
-                    const rows = Array.from(list.querySelectorAll('li[data-deadline]'));
-                    rows.sort((a, b) => {
-                        const x = a.dataset.deadline;
-                        const y = b.dataset.deadline;
-                        if (!x) return y ? 1 : 0;
-                        if (!y) return -1;
-                        return descending ? y.localeCompare(x) : x.localeCompare(y);
-                    });
-                    rows.forEach(row => list.appendChild(row));
-                    document.querySelectorAll('[data-sort]').forEach(button => {
-                        button.setAttribute('aria-pressed', String(button.dataset.sort === (descending ? 'desc' : 'asc')));
-                    });
-                }
-                </script></body></html>
+                    </div></fieldset><p id='sort-help' class='sort-help' aria-live='polite'></p>
+                  </div>
+                  <div id='filter-panel' class='organize-panel' role='tabpanel' aria-labelledby='filter-tab' hidden>
+                """ + filterForm + """
+                  </div>
+                  <footer class='organize-footer'>
+                    <button type='button' class='button button-secondary' onclick="document.getElementById('organize-dialog').close()">キャンセル</button>
+                    <button type='button' class='button button-primary' onclick='applyOrganize()'>決定</button>
+                  </footer>
+                </dialog>
                 """;
         return html;
+    }
+
+    // ★ ラジオボタン（一つだけ選ぶ欄）を、押しやすいボタンの見た目にします。
+    static String sortChoice(String name, String value, String label, boolean checked) {
+        return "<label class='sort-choice'><input type='radio' name='" + name + "' value='" + value + "'"
+                + (checked ? " checked" : "") + "><span>" + label + "</span></label>";
+    }
+
+    // ★ 決定したときだけ並びを反映し、キャンセルでは現在の一覧を変えません。
+    static String organizeScript() {
+        return """
+                <script>
+                const organizeDialog = document.getElementById('organize-dialog');
+                const sortLabels = {added: '追加', deadline: '期限', category: 'カテゴリ', priority: '重要度'};
+                // 画面の更新時は、保存先から受け取る「期限・昇順」を初期状態にします。
+                let appliedSort = {key: 'deadline', direction: 'asc'};
+                let organizeTab = 'sort';
+
+                function openOrganize(tab) {
+                    // 前回キャンセルした選択は捨て、現在の設定から選び直します。
+                    document.getElementById('list-filter-form').reset();
+                    organizeDialog.querySelectorAll('[name="sortKey"]').forEach(input => {
+                        input.checked = input.value === appliedSort.key;
+                    });
+                    organizeDialog.querySelectorAll('[name="sortDirection"]').forEach(input => {
+                        input.checked = input.value === appliedSort.direction;
+                    });
+                    showOrganizeTab(tab);
+                    organizeDialog.showModal();
+                    document.getElementById(tab + '-tab').focus();
+                }
+
+                function showOrganizeTab(tab) {
+                    organizeTab = tab;
+                    for (const name of ['sort', 'filter']) {
+                        const selected = name === tab;
+                        const button = document.getElementById(name + '-tab');
+                        button.setAttribute('aria-selected', String(selected));
+                        button.tabIndex = selected ? 0 : -1;
+                        document.getElementById(name + '-panel').hidden = !selected;
+                    }
+                    updateSortHelp();
+                }
+
+                function updateSortHelp() {
+                    const key = organizeDialog.querySelector('[name="sortKey"]:checked').value;
+                    const direction = organizeDialog.querySelector('[name="sortDirection"]:checked').value;
+                    let text;
+                    if (key === 'added') {
+                        text = direction === 'asc' ? '古い追加順に並びます。' : '新しい追加順に並びます。';
+                    } else if (key === 'deadline') {
+                        text = direction === 'asc' ? '期限が近い順に並びます。' : '期限が遠い順に並びます。';
+                    } else if (key === 'priority') {
+                        text = direction === 'asc' ? '低 → 中 → 高の順に並びます。' : '高 → 中 → 低の順に並びます。';
+                    } else {
+                        text = direction === 'asc' ? '名前の昇順に並びます。' : '名前の降順に並びます。';
+                    }
+                    document.getElementById('sort-help').textContent = text + ' 未設定の項目は末尾になります。';
+                }
+
+                function applyOrganize() {
+                    if (organizeTab === 'filter') {
+                        document.getElementById('list-filter-form').requestSubmit();
+                        return;
+                    }
+                    const key = organizeDialog.querySelector('[name="sortKey"]:checked').value;
+                    const direction = organizeDialog.querySelector('[name="sortDirection"]:checked').value;
+                    const rows = Array.from(document.querySelectorAll('#todo-list > li[data-added]'));
+                    const collator = new Intl.Collator('ja', {numeric: true, sensitivity: 'base'});
+                    const priorities = {'低': 1, '中': 2, '高': 3};
+                    rows.sort((a, b) => {
+                        const x = a.dataset[key];
+                        const y = b.dataset[key];
+                        // 未設定は、昇順・降順のどちらでも末尾に置きます。
+                        if (!x && y) return 1;
+                        if (x && !y) return -1;
+                        let result = 0;
+                        if (x && y) {
+                            if (key === 'added') result = Number(x) - Number(y);
+                            else if (key === 'priority') result = priorities[x] - priorities[y];
+                            else result = collator.compare(x, y);
+                        }
+                        // 同じ値なら追加順にして、操作のたびに並びが揺れないようにします。
+                        return (direction === 'desc' ? -result : result) || Number(a.dataset.added) - Number(b.dataset.added);
+                    });
+                    const list = document.getElementById('todo-list');
+                    rows.forEach(row => list.appendChild(row));
+                    appliedSort = {key, direction};
+                    document.getElementById('current-sort').textContent = sortLabels[key] + '・' + (direction === 'asc' ? '昇順' : '降順');
+                    organizeDialog.close();
+                }
+
+                organizeDialog.addEventListener('change', updateSortHelp);
+                // 左右キーでも、画像上部のタブを切り替えられます。
+                organizeDialog.querySelector('[role="tablist"]').addEventListener('keydown', event => {
+                    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                    event.preventDefault();
+                    const tab = event.key === 'Home' ? 'sort' : event.key === 'End' ? 'filter' : organizeTab === 'sort' ? 'filter' : 'sort';
+                    showOrganizeTab(tab);
+                    document.getElementById(tab + '-tab').focus();
+                });
+                </script>
+                """;
     }
 
     // ★ 色・幅・余白・文字組みを指定のデザイン方針に揃えます。
@@ -604,10 +729,34 @@ public class App {
                 .icon { width: 16px; height: 16px; flex-shrink: 0; }
                 .list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
                 .list-toolbar h2 { font-size: 18px; font-weight: 500; letter-spacing: -.02em; }
-                .sort-control { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--background); }
-                .sort-control button { min-height: 32px; padding: 5px 12px; border: 0; border-radius: 7px; background: transparent; color: #748078; font-size: 12px; }
-                .sort-control button:hover { background: #E9EEE8; color: var(--text); }
-                .sort-control button[aria-pressed='true'] { background: var(--main); color: var(--text); }
+                .list-order { display: flex; align-items: center; gap: 12px; }
+                .current-sort { color: #718076; font-size: 12px; }
+                .sort-trigger { min-height: 36px; padding: 6px 12px; font-size: 12px; background: var(--main); }
+                .organize-dialog { width: min(520px, calc(100% - 32px)); max-height: calc(100vh - 48px); margin: auto; padding: 28px; overflow-y: auto; border: 1px solid #E2E7E1; border-radius: 16px; background: var(--main); color: var(--text); }
+                .organize-dialog::backdrop { background: #242D2740; }
+                .organize-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin-bottom: 26px; background: var(--sidebar); border-radius: 12px; }
+                .organize-tabs button { min-height: 42px; padding: 8px; border: 0; border-radius: 9px; background: transparent; font-size: 16px; font-weight: 500; }
+                .organize-tabs button:hover { background: #DDE5DA; }
+                .organize-tabs button[aria-selected='true'] { background: var(--selected); }
+                .organize-panel { min-height: 300px; }
+                .organize-panel[hidden] { display: none; }
+                .sort-fieldset { min-width: 0; margin: 0 0 24px; padding: 0; border: 0; }
+                .sort-fieldset legend { margin-bottom: 12px; padding: 0; font-size: 18px; font-weight: 500; }
+                .direction-options, .criteria-options { display: grid; gap: 12px; }
+                .direction-options { grid-template-columns: 1fr 1fr; }
+                .criteria-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                .sort-choice { position: relative; min-width: 0; cursor: pointer; }
+                .sort-choice input { position: absolute; width: 1px; height: 1px; min-height: 0; margin: 0; padding: 0; opacity: 0; }
+                .sort-choice span { display: flex; align-items: center; justify-content: center; min-height: 40px; padding: 6px 4px; border: 1px solid #E2E7E1; border-radius: 10px; font-size: 14px; transition: background-color 180ms ease, border-color 180ms ease; }
+                .sort-choice:hover span { background: var(--background); border-color: #C6D1C5; }
+                .sort-choice input:checked + span { background: var(--selected); border-color: #C1D0BE; }
+                .sort-choice input:focus-visible + span { outline: 3px solid #7D9B8340; outline-offset: 3px; }
+                .sort-help { color: #718076; font-size: 12px; line-height: 1.8; }
+                .dialog-filter-form { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+                .dialog-filter-form select { width: 100%; }
+                .dialog-filter-form .show-all { align-self: end; justify-self: start; margin: 0; }
+                .organize-footer { display: flex; justify-content: flex-end; gap: 12px; margin-top: 32px; }
+                .organize-footer .button { min-width: 112px; }
                 .column-headings, .task-row { display: grid; grid-template-columns: minmax(0, 1fr) 144px 100px 190px 78px; gap: 12px; align-items: center; }
                 .column-headings { padding: 0 0 11px; color: var(--muted); font-size: 11px; }
                 .actions-heading { text-align: right; }
@@ -680,7 +829,7 @@ public class App {
                     .list-toolbar { align-items: flex-start; flex-direction: column; }
                 }
                 @media (prefers-reduced-motion: reduce) {
-                    button, a, input, select { transition: none; }
+                    button, a, input, select, .sort-choice span { transition: none; }
                 }
                 """;
     }
@@ -691,6 +840,7 @@ public class App {
             case "list" ->
                 "<rect x='3' y='3' width='18' height='18' rx='4'/><path d='m7 9 1.5 1.5L11 8M13 9h4M7 15h2M13 15h4'/>";
             case "filter" -> "<path d='M4 6h16M7 12h10M10 18h4'/>";
+            case "sort" -> "<path d='M8 4v16m-4-4 4 4 4-4M16 20V4m-4 4 4-4 4 4'/>";
             case "plus" -> "<path d='M12 5v14M5 12h14'/>";
             case "trash" -> "<path d='M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5'/>";
             case "folder" -> "<path d='M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z'/>";
@@ -718,7 +868,7 @@ public class App {
                 Statement statement = connection.createStatement()) { // ★ SQLiteへ接続しSQL実行の準備をします。
             statement.executeUpdate(
                     "CREATE TABLE IF NOT EXISTS genres (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)"); // ★
-                                                                                                              // ジャンルを別の表に保存します。
+                                                                                                              // カテゴリを別の表に保存します。
             statement.executeUpdate(
                     "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER, deadline TEXT, genre_id INTEGER, expired_on TEXT, priority TEXT NOT NULL DEFAULT '中' CHECK (priority IN ('高','中','低')))");
             // ★ 以前の表に期限列がなければ、既存のTodoを残したまま追加します。
@@ -816,7 +966,7 @@ public class App {
     }
 
     // ★変更 TodoをINSERT文でデータベースに追加します。
-    static void addTodo(String title, int genreId) throws IOException { // ★ タイトルとジャンルを保存します。
+    static void addTodo(String title, int genreId) throws IOException { // ★ タイトルとカテゴリを保存します。
         addTodo(title, genreId, "中");
     }
 
@@ -914,7 +1064,7 @@ public class App {
         return loadTodos("", "all"); // ★ JSON用の入口では保管中を含む全件を返します。
     }
 
-    // ★ ジャンルを選んだ場合だけ、保存先で絞り込んで読みます。
+    // ★ カテゴリを選んだ場合だけ、保存先で絞り込んで読みます。
     static List<Todo> loadTodos(String filter) throws IOException {
         return loadTodos(filter, "");
     }
@@ -924,7 +1074,7 @@ public class App {
         return loadTodos(filter, folder, Map.of());
     }
 
-    // ★ ジャンルと新しい3項目の条件を、すべて満たすTodoを読み込みます。
+    // ★ カテゴリと新しい3項目の条件を、すべて満たすTodoを読み込みます。
     static List<Todo> loadTodos(String filter, String folder, Map<Detail, String> detailFilters) throws IOException {
         return loadTodos(filter, folder, detailFilters, "");
     }
@@ -1023,19 +1173,19 @@ public class App {
         return "";
     }
 
-    // ★ ジャンル未選択は0、登録済みジャンルは正の番号として扱います。
+    // ★ カテゴリ未選択は0、登録済みカテゴリは正の番号として扱います。
     static int readGenreId(String value) {
         if (value.isEmpty() || value.equals("0")) {
             return 0;
         }
         int id = Integer.parseInt(value);
         if (id < 1) {
-            throw new NumberFormatException("ジャンル番号は正の数です");
+            throw new NumberFormatException("カテゴリ番号は正の数です");
         }
         return id;
     }
 
-    // ★ 絞り込み値は「すべて」「未分類」「正のジャンル番号」に限定します。
+    // ★ 絞り込み値は「すべて」「未分類」「正のカテゴリ番号」に限定します。
     static String normalizedFilter(String filter) {
         if (filter.equals("none")) {
             return "none";
@@ -1048,7 +1198,7 @@ public class App {
         }
     }
 
-    // ★ 各操作の後も同じジャンルの一覧へ戻します。
+    // ★ 各操作の後も同じカテゴリの一覧へ戻します。
     static String listLocation(String filter) {
         return listLocation(filter, "");
     }
@@ -1384,7 +1534,7 @@ public class App {
                 .replace("'", "&#39;");
     }
 
-    // ★ 追加フォームと各Todoで共通のジャンル選択欄を作ります。
+    // ★ 追加フォームと各Todoで共通のカテゴリ選択欄を作ります。
     static String genreSelect(Map<Integer, String> genres, int selected) {
         String html = "<select name='genre'><option value='0'" + (selected == 0 ? " selected" : "") + ">未分類</option>";
         for (Map.Entry<Integer, String> genre : genres.entrySet()) {
@@ -1408,7 +1558,7 @@ public class App {
         return html + "</select>";
     }
 
-    // ★ 重要度だけを書き換え、期限・ジャンル・完了状態は保持します。
+    // ★ 重要度だけを書き換え、期限・カテゴリ・完了状態は保持します。
     static void updatePriority(int id, String priority) throws IOException {
         if (!isValidPriority(priority)) {
             return;
@@ -1423,7 +1573,7 @@ public class App {
         }
     }
 
-    // ★ ジャンル名は重複登録せず、空のジャンルも一覧に残しておきます。
+    // ★ カテゴリ名は重複登録せず、空のカテゴリも一覧に残しておきます。
     static void addGenre(String name) throws IOException {
         try (Connection connection = openDatabase();
                 PreparedStatement statement = connection
@@ -1435,7 +1585,7 @@ public class App {
         }
     }
 
-    // ★ 登録済みジャンルを名前順に読み込みます。
+    // ★ 登録済みカテゴリを名前順に読み込みます。
     static Map<Integer, String> loadGenres() throws IOException {
         Map<Integer, String> genres = new LinkedHashMap<>();
         try (Connection connection = openDatabase();
@@ -1451,7 +1601,7 @@ public class App {
         return genres;
     }
 
-    // ★ Todoとジャンルの対応を保存します。未分類なら空の値に戻します。
+    // ★ Todoとカテゴリの対応を保存します。未分類なら空の値に戻します。
     static void updateGenre(int id, int genreId) throws IOException {
         try (Connection connection = openDatabase();
                 PreparedStatement statement = connection
@@ -1556,7 +1706,7 @@ class Todo {
     private String expiredOn = "";
     // ★ 重要度は初期値を「中」にします。
     private String priority = "中";
-    // ★ ジャンルの番号と表示名を持ち、番号0は未分類を表します。
+    // ★ カテゴリの番号と表示名を持ち、番号0は未分類を表します。
     private int genreId;
     private String genreName = "";
     // ★ 場所・関係者・プロジェクトの番号と表示名を持ちます（Mapは名前と値の対応表です）。
@@ -1618,7 +1768,7 @@ class Todo {
         this.priority = priority == null ? "中" : priority;
     }
 
-    // ★ Todoに設定したジャンルを読み出します。
+    // ★ Todoに設定したカテゴリを読み出します。
     int getGenreId() {
         return genreId;
     }
