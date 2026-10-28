@@ -531,7 +531,8 @@ public class App {
         // ★ 一覧の並び替えは、ポップアップで選んで決定する形にします。
         html += "<section class='list-section" + (expiredFolder ? " archived-list" : "") + "' aria-labelledby='list-heading'><div class='list-toolbar'><h2 id='list-heading'>一覧</h2><div class='list-order'><span id='current-sort' class='current-sort' aria-live='polite'>期限・昇順</span><button type='button' class='button button-secondary sort-trigger' onclick=\"openOrganize('sort')\" aria-haspopup='dialog' aria-controls='organize-dialog'>"
                 + uiIcon("sort") + "並び替え</button></div></div>";
-        html += "<div class='column-headings' aria-hidden='true'><span>やること</span><span>カテゴリ</span><span>重要度</span><span>期限</span><span class='actions-heading'>操作</span></div><ul id='todo-list' class='todo-list'>";
+        html += "<div class='column-headings' aria-hidden='true'><span>やること</span><span>完了状態</span><span>重要度</span><span>期限</span></div><ul id='todo-list' class='todo-list'>";
+        String todoDialogs = ""; // ★ 分類の編集欄は、一覧の外にある詳細ポップアップへまとめます。
         if (todos.isEmpty()) {
             html += "<li class='empty-state'>"
                     + (expiredFolder ? "期限切れのTodoはありません"
@@ -545,71 +546,178 @@ public class App {
                 html += "<li class='task-row' data-added='" + todo.getId() + "' data-deadline='" + escapeHtml(todo.getDeadline())
                         + "' data-priority='" + escapeHtml(todo.getPriority())
                         + "' data-category='" + escapeHtml(todo.getGenreId() == 0 ? "" : todo.getGenreName())
-                        + "'><div class='task-title-box'><span class='task-title'>" + escapeHtml(todo.getTitle())
-                        + "</span>" + (todo.isDone() ? "<span class='completion-mark'> ✔</span>" : "");
+                        + "'><div class='task-title-box'><button type='button' class='task-title todo-detail-trigger'"
+                        + " aria-haspopup='dialog' aria-controls='todo-dialog-" + todo.getId() + "'>"
+                        + escapeHtml(todo.getTitle()) + "</button></div>";
+                // ★ 未完了の表示から、従来と同じ完了処理を呼び出せます。
+                html += "<div class='task-status'>" + (todo.isDone()
+                        ? "<span class='completion-mark'>✔ 完了</span>"
+                        : expiredFolder ? "<span class='unfinished-status'>未完了</span>"
+                                : "<a class='complete-link' href='/done?id=" + todo.getId() + filterQuery
+                                        + "' aria-label='完了にする' title='クリックして完了にする'>未完了</a>") + "</div>";
                 if (expiredFolder) {
-                    html += "<p class='task-note'>自動削除：" + LocalDate.parse(todo.getExpiredOn()).plusDays(30)
-                            + "</p></div><span class='task-genre archived-value'>"
-                            + escapeHtml(todo.getGenreId() == 0 ? "未分類" : todo.getGenreName())
-                            + "</span><span class='task-priority archived-value'>" + escapeHtml(todo.getPriority())
+                    html += "<span class='task-priority archived-value'>" + escapeHtml(todo.getPriority())
                             + "</span><span class='task-deadline archived-value'>" + escapeHtml(todo.getDeadline())
                             + "</span>";
                 } else {
-                    html += "</div><form class='task-field task-genre' method='post' action='/genre' aria-label='カテゴリの変更'>"
-                            + hiddenId + hiddenFilter + "<div class='control-label'>"
-                            + genreSelect(genres, todo.getGenreId())
-                            + "</div><button class='save-button' aria-label='カテゴリを保存' title='カテゴリを保存'>保存</button></form>";
-                    html += "<form class='task-field task-priority' method='post' action='/priority' aria-label='重要度の変更'>"
+                    html += "<form class='task-field task-priority' data-autosave method='post' action='/priority' aria-label='重要度の変更'>"
                             + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>重要度</span>"
                             + prioritySelect(todo.getPriority())
-                            + "</label><button class='save-button' aria-label='重要度を保存' title='重要度を保存'>保存</button></form>";
-                    html += "<form class='task-field task-deadline' method='post' action='/deadline' aria-label='期限の変更'>"
+                            + "</label></form>";
+                    html += "<form class='task-field task-deadline' data-autosave method='post' action='/deadline' aria-label='期限の変更'>"
                             + hiddenId + hiddenFilter
                             + "<label class='control-label'><span class='sr-only'>期限</span><input type='date' name='deadline' max='9999-12-31' value='"
                             + escapeHtml(todo.getDeadline())
-                            + "'></label><button class='save-button' aria-label='期限を保存' title='期限を保存'>保存</button></form>";
+                            + "'></label></form>";
                 }
-                html += "<div class='task-actions'>"
-                        + (!expiredFolder
-                                ? "<a class='complete-link' href='/done?id=" + todo.getId() + filterQuery
-                                        + "'>完了</a>"
-                                : "<form class='restore-form' method='post' action='/restore'>" + hiddenId + hiddenFilter
-                                        + "<button class='restore-button' title='期限を未登録にして通常の一覧に戻します'>リストに戻す</button></form>")
-                        + "<a class='delete-link' href='/delete?id=" + todo.getId()
-                        + "&amp;folder=" + folder + filterQuery + "' aria-label='削除' title='削除'>" + uiIcon("trash")
-                        + "</a></div>";
-                // ★ 横幅を増やさず、各Todoの下段に場所・関係者・プロジェクトを並べます。
-                html += "<div class='task-details'>";
+                html += "</li>";
+                todoDialogs += "<dialog id='todo-dialog-" + todo.getId() + "' class='todo-detail-dialog'"
+                        + " aria-labelledby='todo-dialog-title-" + todo.getId() + "'><div class='todo-dialog-content'><div class='todo-dialog-header'>"
+                        + "<h2 id='todo-dialog-title-" + todo.getId() + "'>" + escapeHtml(todo.getTitle())
+                        + "</h2><button type='button' class='button button-secondary todo-dialog-close' autofocus>閉じる</button></div>";
+                if (expiredFolder) {
+                    todoDialogs += "<p class='task-note'>自動削除：" + LocalDate.parse(todo.getExpiredOn()).plusDays(30) + "</p>";
+                }
+                todoDialogs += "<div class='todo-dialog-fields'>";
+                if (expiredFolder) {
+                    todoDialogs += "<div class='detail-value'><span class='field-label'>カテゴリ</span><span class='archived-value'>"
+                            + escapeHtml(todo.getGenreId() == 0 ? "未分類" : todo.getGenreName()) + "</span></div>";
+                } else {
+                    todoDialogs += "<form class='task-detail' data-autosave method='post' action='/genre' aria-label='カテゴリの変更'>"
+                            + hiddenId + hiddenFilter + "<div class='field'><span class='field-label'>カテゴリ</span>"
+                            + genreSelect(genres, todo.getGenreId())
+                            + "</div></form>";
+                }
                 for (Detail detail : Detail.values()) {
                     if (expiredFolder) {
-                        html += "<div class='detail-value'><span class='field-label'>" + detail.label
+                        todoDialogs += "<div class='detail-value'><span class='field-label'>" + detail.label
                                 + "</span><span class='archived-value'>"
                                 + escapeHtml(todo.getDetailId(detail.key) == 0 ? "未設定" : todo.getDetailName(detail.key))
                                 + "</span></div>";
                     } else {
-                        html += "<form class='task-detail' method='post' action='/" + detail.key
+                        todoDialogs += "<form class='task-detail' data-autosave method='post' action='/" + detail.key
                                 + "' aria-label='" + detail.label + "の変更'>" + hiddenId + hiddenFilter
                                 + "<div class='field'><span class='field-label'>" + detail.label + "</span>"
                                 + detailSelect(detail, details.get(detail), todo.getDetailId(detail.key))
-                                + "</div><button class='save-button' aria-label='" + detail.label
-                                + "を保存' title='" + detail.label + "を保存'>保存</button></form>";
+                                + "</div></form>";
                     }
                 }
                 if (expiredFolder) {
-                    html += "<div class='task-tags'><div class='detail-value'><span class='field-label'>タグ</span>"
+                    todoDialogs += "<div class='task-tags'><div class='detail-value'><span class='field-label'>タグ</span>"
                             + tagNames(todo.getTags()) + "</div></div>";
                 } else {
-                    html += "<form class='task-tags' method='post' action='/tags' aria-label='タグの変更'>"
+                    todoDialogs += "<form class='task-tags' data-autosave method='post' action='/tags' aria-label='タグの変更'>"
                             + hiddenId + hiddenFilter + tagPicker(tags, new ArrayList<>(todo.getTags().keySet()))
-                            + "<button class='save-button' aria-label='タグを保存' title='タグを保存'>保存</button></form>";
+                            + "</form>";
                 }
-                html += "</div></li>";
+                todoDialogs += "</div><div class='todo-dialog-actions'>"
+                        + (expiredFolder ? "<form class='restore-form' method='post' action='/restore'>" + hiddenId + hiddenFilter
+                                + "<button class='restore-button' title='期限を未登録にして通常の一覧に戻します'>リストに戻す</button></form>" : "")
+                        + "<a class='delete-link' href='/delete?id=" + todo.getId() + "&amp;folder=" + folder + filterQuery
+                        + "' aria-label='削除' title='削除'>" + uiIcon("trash") + "<span>削除</span></a></div></div></dialog>";
             }
         }
         html += "</ul></section></div></main></div>";
-        html += organizeDialog(filterForm) + organizeScript()
-                + classificationBootstrap(genres, details, tags) + classificationScript() + quickAddScript() + "</body></html>";
+        html += todoDialogs + organizeDialog(filterForm) + organizeScript()
+                + classificationBootstrap(genres, details, tags) + classificationScript() + quickAddScript() + todoDetailScript() + autoSaveScript() + "</body></html>";
         return html;
+    }
+
+    // ★ 既存の保存先へ通信し、画面や詳細ポップアップを開いたまま編集内容を保存します。
+    static String autoSaveScript() {
+        return """
+                <script>
+                (() => {
+                    let queue = Promise.resolve();
+                    const list = document.getElementById('todo-list');
+                    document.querySelectorAll('form[data-autosave]').forEach(form => {
+                        const serialize = () => new URLSearchParams(new FormData(form)).toString();
+                        const state = {saved: serialize(), queued: serialize(), revision: 0, timer: null};
+                        const feedback = document.createElement('div'); feedback.className = 'autosave-feedback';
+                        const status = document.createElement('span'); status.className = 'autosave-status';
+                        status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+                        const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'autosave-retry';
+                        retry.textContent = '再試行'; retry.hidden = true;
+                        feedback.append(status, retry); form.append(feedback);
+
+                        function save() {
+                            clearTimeout(state.timer);
+                            if (!form.checkValidity()) return;
+                            const body = serialize();
+                            if (body === state.queued) return;
+                            state.queued = body;
+                            const revision = ++state.revision;
+                            retry.hidden = true; status.textContent = '保存中…';
+                            feedback.classList.remove('is-error'); form.setAttribute('aria-busy', 'true');
+                            // 連続して変更した場合も、変更した順番で保存します。
+                            queue = queue.then(async () => {
+                                try {
+                                    const response = await fetch(form.action, {method: 'POST', keepalive: true,
+                                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, body});
+                                    if (!response.ok) throw new Error('save failed');
+                                    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+                                    const savedList = page.getElementById('todo-list');
+                                    if (!savedList) throw new Error('invalid response');
+                                    state.saved = body;
+                                    // 保存先が返した一覧で、並び替え用の値とフィルターへの一致を更新します。
+                                    const id = new URLSearchParams(body).get('id');
+                                    const selector = 'li[data-added="' + CSS.escape(id) + '"]';
+                                    const row = list.querySelector(selector), savedRow = savedList.querySelector(selector);
+                                    if (row) {
+                                        row.hidden = !savedRow;
+                                        if (savedRow) Object.assign(row.dataset, savedRow.dataset);
+                                    }
+                                    let empty = list.querySelector('.empty-state');
+                                    if (!list.querySelector('li[data-added]:not([hidden])')) {
+                                        if (!empty) { empty = document.createElement('li'); empty.className = 'empty-state'; list.append(empty); }
+                                        empty.textContent = savedList.querySelector('.empty-state')?.textContent || 'この条件のTodoはありません';
+                                    } else if (empty) empty.remove();
+                                    sortTodoRows(appliedSort.key, appliedSort.direction);
+                                    if (revision === state.revision) status.textContent = '保存済み';
+                                } catch (error) {
+                                    if (revision === state.revision) {
+                                        state.queued = state.saved; status.textContent = '保存できませんでした';
+                                        feedback.classList.add('is-error'); retry.hidden = false;
+                                    }
+                                } finally {
+                                    if (revision === state.revision) form.removeAttribute('aria-busy');
+                                }
+                            });
+                        }
+                        retry.addEventListener('click', () => { state.queued = null; save(); });
+                        form.addEventListener('classificationchange', save);
+                        form.addEventListener('change', event => {
+                            if (event.target.matches('input[type="date"]')) {
+                                // 日付の入力途中で保存せず、入力が落ち着いてから保存します。
+                                clearTimeout(state.timer); state.timer = setTimeout(save, 500);
+                            } else if (event.target.matches('select')) save();
+                        });
+                        form.addEventListener('submit', event => { event.preventDefault(); save(); });
+                    });
+                })();
+                </script>
+                """;
+    }
+
+    // ★ Todo名を押して詳細を開き、閉じたあとは元のTodo名へフォーカスを戻します。
+    static String todoDetailScript() {
+        return """
+                <script>
+                (() => {
+                    document.querySelectorAll('.todo-detail-trigger').forEach(trigger => {
+                        const dialog = document.getElementById(trigger.getAttribute('aria-controls'));
+                        trigger.addEventListener('click', () => dialog.showModal());
+                        dialog.querySelector('.todo-dialog-close').addEventListener('click', () => dialog.close());
+                        dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+                        dialog.addEventListener('close', () => {
+                            dialog.querySelectorAll('.classification-combo').forEach(root => root.dispatchEvent(new Event('classification-close')));
+                            if (!trigger.closest('.task-row').hidden) trigger.focus({preventScroll: true});
+                            else { const heading = document.getElementById('list-heading'); heading.tabIndex = -1; heading.focus({preventScroll: true}); }
+                        });
+                    });
+                })();
+                </script>
+                """;
     }
 
     // ★ 保存形式やフォームの項目名は変えず、見た目を検索付きの共通選択欄にします。
@@ -1123,8 +1231,17 @@ public class App {
                 <script>
                 const organizeDialog = document.getElementById('organize-dialog');
                 const sortLabels = {added: '追加', deadline: '期限', category: 'カテゴリ', priority: '重要度'};
-                // 画面の更新時は、保存先から受け取る「期限・昇順」を初期状態にします。
+                // ★ 並び替えの基準と昇順・降順を、同じブラウザに保存して読み戻します。
+                const sortStorageKey = 'todo.sortPreference';
                 let appliedSort = {key: 'deadline', direction: 'asc'};
+                try {
+                    const saved = JSON.parse(localStorage.getItem(sortStorageKey));
+                    if (saved && Object.hasOwn(sortLabels, saved.key) && ['asc', 'desc'].includes(saved.direction)) {
+                        appliedSort = {key: saved.key, direction: saved.direction};
+                    }
+                } catch (error) {
+                    // ブラウザの保存が使えない場合も、一覧の表示は続けます。
+                }
                 let organizeTab = 'sort';
 
                 function openOrganize(tab) {
@@ -1177,6 +1294,17 @@ public class App {
                     }
                     const key = organizeDialog.querySelector('[name="sortKey"]:checked').value;
                     const direction = organizeDialog.querySelector('[name="sortDirection"]:checked').value;
+                    sortTodoRows(key, direction);
+                    try {
+                        localStorage.setItem(sortStorageKey, JSON.stringify(appliedSort));
+                    } catch (error) {
+                        // 保存が制限されていても、その画面での並び替えは反映します。
+                    }
+                    organizeDialog.close();
+                }
+
+                // ★ 決定時と画面の読み込み時に、同じ処理で一覧を並び替えます。
+                function sortTodoRows(key, direction) {
                     const rows = Array.from(document.querySelectorAll('#todo-list > li[data-added]'));
                     const collator = new Intl.Collator('ja', {numeric: true, sensitivity: 'base'});
                     const priorities = {'低': 1, '中': 2, '高': 3};
@@ -1199,7 +1327,6 @@ public class App {
                     rows.forEach(row => list.appendChild(row));
                     appliedSort = {key, direction};
                     document.getElementById('current-sort').textContent = sortLabels[key] + '・' + (direction === 'asc' ? '昇順' : '降順');
-                    organizeDialog.close();
                 }
 
                 function updateFilterSummaries() {
@@ -1237,6 +1364,8 @@ public class App {
                     showOrganizeTab(tab);
                     document.getElementById(tab + '-tab').focus();
                 });
+                // ★ 更新・追加・編集などで画面を開き直しても、保存した順序を反映します。
+                sortTodoRows(appliedSort.key, appliedSort.direction);
                 </script>
                 """;
     }
@@ -1384,12 +1513,28 @@ public class App {
                 .filter-help { color: #718076; font-size: 12px; line-height: 1.8; }
                 .organize-footer { display: flex; justify-content: flex-end; gap: 12px; margin-top: 32px; }
                 .organize-footer .button { min-width: 112px; }
-                .column-headings, .task-row { display: grid; grid-template-columns: minmax(0, 1fr) 144px 100px 190px 78px; gap: 12px; align-items: center; }
+                .column-headings, .task-row { display: grid; grid-template-columns: minmax(0, 1fr) 84px 100px 190px; gap: 16px; align-items: center; }
                 .column-headings { padding: 0 0 11px; color: var(--muted); font-size: 11px; }
                 .actions-heading { text-align: right; }
                 .todo-list { list-style: none; padding: 0; border-top: 1px solid var(--line); }
                 .task-row { min-height: 72px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+                .task-row[hidden] { display: none; }
                 .task-title-box { min-width: 0; font-size: 14px; overflow-wrap: anywhere; }
+                .todo-detail-trigger { display: inline-block; max-width: 100%; padding: 4px 0; border: 0; border-radius: 4px; background: transparent; text-align: left; font-size: inherit; line-height: inherit; overflow-wrap: anywhere; }
+                .todo-detail-trigger:hover { color: #526D58; text-decoration: underline; text-underline-offset: 4px; }
+                .task-status { font-size: 12px; }
+                .unfinished-status { color: #718076; }
+                .todo-detail-dialog { position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 24px 16px; overflow-y: auto; border: 0; background: transparent; color: var(--text); }
+                .todo-detail-dialog[open] { display: flex; flex-direction: column; }
+                .todo-detail-dialog::backdrop { background: #242D2740; }
+                .todo-dialog-content { flex: 0 0 auto; width: min(620px, 100%); margin: auto; padding: 28px; border: 1px solid #E2E7E1; border-radius: 16px; background: var(--main); }
+                .todo-dialog-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 28px; }
+                .todo-dialog-header h2 { min-width: 0; font-size: 20px; font-weight: 500; overflow-wrap: anywhere; }
+                .todo-dialog-close { flex-shrink: 0; min-height: 34px; padding: 5px 10px; font-size: 12px; }
+                .todo-dialog-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px 20px; }
+                .todo-detail-dialog .task-note { margin-bottom: 20px; color: #718076; font-size: 12px; }
+                .todo-dialog-actions { display: flex; justify-content: flex-end; align-items: center; gap: 16px; margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
+                .todo-dialog-actions .delete-link { width: auto; gap: 6px; padding: 5px 9px; font-size: 12px; }
                 .completion-mark { color: #617F68; }
                 .task-field { display: flex; align-items: center; min-width: 0; gap: 6px; }
                 .control-label { flex: 1; min-width: 0; }
@@ -1437,6 +1582,11 @@ public class App {
                 .tag-options legend { margin-bottom: 7px; padding: 0; color: #718076; font-size: 12px; }
                 .add-form > .tag-options, .task-tags { grid-column: 1 / -1; }
                 .task-tags { display: flex; align-items: flex-end; gap: 12px; min-width: 0; }
+                form[data-autosave] { display: flex; flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; }
+                .autosave-feedback { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-height: 16px; color: #718076; font-size: 11px; line-height: 1.4; }
+                .autosave-feedback.is-error { color: #8A493B; }
+                .autosave-retry { padding: 2px 6px; border: 1px solid #DDE3DC; border-radius: 5px; background: var(--main); font-size: 11px; }
+                .autosave-retry[hidden] { display: none; }
                 .task-tags > .tag-options { flex: 1; }
                 .tag-choices { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; }
                 .tag-choice { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 32px; padding: 3px 7px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; cursor: pointer; }
@@ -1446,10 +1596,8 @@ public class App {
                 .tag-choice span, .tag-name { overflow-wrap: anywhere; min-width: 0; }
                 .tag-hint { color: #718076; font-size: 12px; }
                 .tag-name { padding: 3px 8px; background: var(--selected); border-radius: 8px; font-size: 12px; }
-                .save-button { min-height: 32px; flex: 0 0 36px; padding: 4px 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--main); color: #6A786D; font-size: 11px; }
-                .save-button:hover { background: var(--sidebar); color: var(--text); border-color: #D4DED2; }
                 .task-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
-                .archived-list .column-headings, .archived-list .task-row { grid-template-columns: minmax(0, 1fr) 130px 72px 132px 148px; }
+                .archived-list .column-headings, .archived-list .task-row { grid-template-columns: minmax(0, 1fr) 84px 100px 190px; }
                 .restore-form { margin: 0; display: flex; }
                 .restore-button { min-height: 32px; padding: 5px 10px; border: 1px solid #DDE3DC; border-radius: 8px; background: var(--main); color: #607D66; font-size: 12px; white-space: nowrap; }
                 .restore-button:hover { background: var(--sidebar); border-color: var(--selected); color: var(--text); }
@@ -1461,18 +1609,16 @@ public class App {
                 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
                 @media (max-width: 1100px) {
                     .main-pane { padding: 48px 28px 72px; }
-                    .column-headings, .task-row { gap: 10px; grid-template-columns: minmax(0, 1fr) 130px 96px 174px 72px; }
+                    .column-headings, .task-row, .archived-list .column-headings, .archived-list .task-row { gap: 10px; grid-template-columns: minmax(0, 1fr) 72px 96px 174px; }
                 }
                 @media (max-width: 960px) {
                     .column-headings { display: none; }
                     .task-row { grid-template-columns: repeat(6, minmax(0, 1fr)); row-gap: 12px; }
                     .archived-list .task-row { grid-template-columns: repeat(6, minmax(0, 1fr)); }
                     .task-title-box { grid-column: 1 / span 4; grid-row: 1; }
-                    .task-actions { grid-column: 5 / span 2; grid-row: 1; }
-                    .task-genre { grid-column: 1 / span 3; grid-row: 2; }
-                    .task-priority { grid-column: 4 / span 3; grid-row: 2; }
-                    .task-deadline { grid-column: 1 / -1; grid-row: 3; }
-                    .task-details { grid-row: 4; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+                    .task-status { grid-column: 5 / span 2; grid-row: 1; text-align: right; }
+                    .task-priority { grid-column: 1 / span 2; grid-row: 2; }
+                    .task-deadline { grid-column: 3 / span 4; grid-row: 2; }
                 }
                 @media (max-width: 700px) {
                     .workspace { display: block; }
@@ -1488,6 +1634,8 @@ public class App {
                     .main-pane { padding: 36px 24px 64px; }
                     .quick-add-controls { align-items: flex-start; }
                     .add-details-grid { grid-template-columns: minmax(0, 1fr); }
+                    .todo-dialog-content { padding: 22px; }
+                    .todo-dialog-fields { grid-template-columns: minmax(0, 1fr); }
                     .page-header { margin-bottom: 32px; }
                     h1 { font-size: 26px; }
                     .list-toolbar { align-items: flex-start; flex-direction: column; }
