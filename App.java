@@ -1,9 +1,11 @@
 
 // Webサーバー（ブラウザからの接続を受ける仕組み）を使います。
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpExchange; // ★ 分類登録の結果を、その場で画面へ返します。
 // ポート番号を指定するための住所情報を使います。
 import java.net.InetSocketAddress;
 import java.net.URLDecoder; // URL形式の文字を元に戻す機能を使います。
+import java.net.URLEncoder; // ★ 複数の絞り込み条件を、日本語も含めてURLへ安全に書き込みます。
 import java.nio.charset.StandardCharsets; // UTF-8の文字コードを指定する機能を使います。
 import java.time.LocalDate; // ★ 期限を日付として確認する標準機能です。
 import java.time.ZoneId; // ★ 期限の判定は日本時間で統一します。
@@ -19,6 +21,8 @@ import java.util.List; // 複数のTodoを並べて持つ一覧を使います�
 import java.util.ArrayList; // Todo一覧を作るための機能を使います。
 import java.util.Map; // ★ カテゴリの番号と名前を対応させます。
 import java.util.LinkedHashMap; // ★ 読み込んだカテゴリの順序を保ちます。
+import java.util.Locale; // ★ 名前の比較で英字の大文字・小文字を揃えます。
+import java.text.Normalizer; // ★ 全角・半角などの違いによる重複を防ぎます。
 import java.util.concurrent.Executors; // ★ 定期的に自動削除を実行します。
 import java.util.concurrent.ScheduledExecutorService; // ★ 定期処理を動かすための標準機能です。
 import java.util.concurrent.TimeUnit; // ★ 定期処理の間隔を分で指定します。
@@ -27,6 +31,50 @@ import java.util.concurrent.TimeUnit; // ★ 定期処理の間隔を分で指�
 public class App {
     // ★変更 SQLiteデータベースの接続先です。
     static final String DB_URL = "jdbc:sqlite:todos.db";
+
+    // ★ 各項目に複数の条件を持ち、選んでいない項目は「すべて」として扱います。
+    static final String[][] FILTER_FIELDS = {
+            { "statusFilter", "ステータス" }, { "priorityFilter", "重要度" },
+            { "deadlineFilter", "期限" }, { "filter", "カテゴリ" },
+            { "locationFilter", "場所" }, { "personFilter", "関係者" },
+            { "tagFilter", "タグ" }, { "projectFilter", "プロジェクト" }
+    };
+
+    static class Filters {
+        final Map<String, List<String>> values = new LinkedHashMap<>();
+
+        List<String> get(String key) {
+            return values.getOrDefault(key, List.of());
+        }
+
+        boolean active() {
+            for (List<String> selected : values.values()) {
+                if (!selected.isEmpty()) return true;
+            }
+            return false;
+        }
+
+        // ★ 同じ項目名を繰り返して、複数の選択を欠けずに引き継ぎます。
+        String query() {
+            List<String> fields = new ArrayList<>();
+            for (String[] field : FILTER_FIELDS) {
+                for (String value : get(field[0])) {
+                    fields.add(field[0] + "=" + URLEncoder.encode(value, StandardCharsets.UTF_8));
+                }
+            }
+            return String.join("&", fields);
+        }
+
+        String hiddenInputs() {
+            String html = "";
+            for (String[] field : FILTER_FIELDS) {
+                for (String value : get(field[0])) {
+                    html += "<input type='hidden' name='" + field[0] + "' value='" + escapeHtml(value) + "'>";
+                }
+            }
+            return html;
+        }
+    }
 
     // ★ 場所・関係者・プロジェクトの名前と保存先をまとめます（enumは決まった種類の一覧です）。
     enum Detail {
@@ -53,6 +101,29 @@ public class App {
         }
     }
 
+    // ★ 既存の5種類の保存先を共通の分類UIから扱います。表や列の名前はここで固定します。
+    enum Classification {
+        CATEGORY("category", "genres", "genre_id", "genre", "カテゴリ", "未分類"),
+        LOCATION("location", "locations", "location_id", "location", "場所", "未設定"),
+        PERSON("person", "people", "person_id", "person", "関係者", "未設定"),
+        PROJECT("project", "projects", "project_id", "project", "プロジェクト", "未設定"),
+        TAG("tag", "tags", null, "tag", "タグ", "");
+
+        final String key, table, column, formName, label, emptyLabel;
+
+        Classification(String key, String table, String column, String formName, String label, String emptyLabel) {
+            this.key = key;
+            this.table = table;
+            this.column = column;
+            this.formName = formName;
+            this.label = label;
+            this.emptyLabel = emptyLabel;
+        }
+    }
+
+    // ★ 分類の番号・名前・使用中のTodo件数を一組にします（recordは値をまとめる書き方です）。
+    record ClassificationItem(int id, String name, int uses) { }
+
     // プログラムの実行が始まる場所で、例外（予期しない問題）を呼び出し元に伝えます。
     public static void main(String[] args) throws Exception {
         // ★変更 todos表を用意します。表はデータを行と列で保存する場所です。
@@ -72,7 +143,38 @@ public class App {
             // 返す文字を入れる場所を用意します。
             String message;
             // /addへのPOST（フォーム送信）ならTodoをデータベースへ追加します。
-            if (path.equals("/add") && method.equals("POST")) {
+            if (path.equals("/classifications") && method.equals("GET")) {
+                Classification kind = classificationForKey(formValue(exchange.getRequestURI().getRawQuery(), "type"));
+                if (kind == null) kind = Classification.CATEGORY;
+                String query = exchange.getRequestURI().getRawQuery();
+                message = renderClassificationManagement(kind, formValue(query, "notice"), readFilters(query), formValue(query, "folder"));
+                exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+            } else if ((path.equals("/classifications/rename") || path.equals("/classifications/delete"))
+                    && method.equals("POST")) {
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                Classification kind = classificationForKey(formValue(body, "type"));
+                String notice;
+                try {
+                    if (kind == null) throw new IllegalArgumentException();
+                    int id = Integer.parseInt(formValue(body, "id"));
+                    if (path.endsWith("/rename")) {
+                        renameClassification(kind, id, formValue(body, "name"));
+                        notice = "renamed";
+                    } else {
+                        deleteClassification(kind, id);
+                        notice = "deleted";
+                    }
+                } catch (IllegalArgumentException e) {
+                    notice = "invalid";
+                } catch (IOException e) {
+                    notice = "error";
+                }
+                exchange.getResponseHeaders().set("Location", classificationLocation(
+                        kind == null ? Classification.CATEGORY : kind, readFilters(body), formValue(body, "folder"), notice));
+                exchange.sendResponseHeaders(303, -1);
+                exchange.close();
+                return;
+            } else if (path.equals("/add") && method.equals("POST")) {
                 // 送信された中身をUTF-8の文字として読み取ります。
                 String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
                 // ★ 複数の入力欄から、やることとカテゴリを取り出します。
@@ -93,7 +195,7 @@ public class App {
                 }
                 // 追加後にトップページへ戻る場所を指定します。
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 // 303でトップページへ移動する応答を返します。
                 exchange.sendResponseHeaders(303, -1);
                 // このリクエストへの応答を閉じます。
@@ -108,7 +210,7 @@ public class App {
                     addGenre(name);
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -120,7 +222,7 @@ public class App {
                     addTag(name);
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -134,7 +236,7 @@ public class App {
                     // ★ 不正な番号が含まれるときは、タグ設定を変更しません。
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -151,7 +253,7 @@ public class App {
                     // ★ 不正な番号では変更しません。
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -164,7 +266,7 @@ public class App {
                     addDetail(detail, name);
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -180,7 +282,7 @@ public class App {
                     // ★ 不正な番号では変更しません。
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -197,7 +299,7 @@ public class App {
                     // ★ 不正な番号では変更しません。
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -215,7 +317,7 @@ public class App {
                     // ★ 番号や日付が不正なら保存せず一覧へ戻ります。
                 }
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(body, "filter"), formValue(body, "folder"), readDetailFilters(body), formValue(body, "tagFilter")));
+                        listLocation(readFilters(body), formValue(body, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -228,7 +330,7 @@ public class App {
                 } catch (NumberFormatException e) {
                     // ★ 不正な番号では変更しません。
                 }
-                exchange.getResponseHeaders().set("Location", listLocation(formValue(body, "filter"), "", readDetailFilters(body), formValue(body, "tagFilter")));
+                exchange.getResponseHeaders().set("Location", listLocation(readFilters(body), ""));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -249,7 +351,7 @@ public class App {
                 }
                 // 処理後にトップページへ戻る場所を指定します。
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(query, "filter"), formValue(query, "folder"), readDetailFilters(query), formValue(query, "tagFilter")));
+                        listLocation(readFilters(query), formValue(query, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -270,7 +372,7 @@ public class App {
                 }
                 // 処理後にトップページへ戻る場所を指定します。
                 exchange.getResponseHeaders().set("Location",
-                        listLocation(formValue(query, "filter"), formValue(query, "folder"), readDetailFilters(query), formValue(query, "tagFilter")));
+                        listLocation(readFilters(query), formValue(query, "folder")));
                 exchange.sendResponseHeaders(303, -1);
                 exchange.close();
                 return;
@@ -278,31 +380,15 @@ public class App {
             } else if (path.equals("/")) {
                 // ★ カテゴリと絞り込み条件を読み込みます。
                 Map<Integer, String> genres = loadGenres();
-                String filter = normalizedFilter(formValue(exchange.getRequestURI().getRawQuery(), "filter"));
-                if (!filter.isEmpty() && !filter.equals("none") && !genres.containsKey(Integer.parseInt(filter))) {
-                    filter = "";
-                }
                 String query = exchange.getRequestURI().getRawQuery();
                 Map<Detail, Map<Integer, String>> details = loadDetails();
                 Map<Integer, String> tags = loadTags();
-                String tagFilter = normalizedFilter(formValue(query, "tagFilter"));
-                if (!tagFilter.isEmpty() && !tagFilter.equals("none")
-                        && !tags.containsKey(Integer.parseInt(tagFilter))) {
-                    tagFilter = "";
-                }
-                Map<Detail, String> detailFilters = readDetailFilters(query);
-                // ★ 存在しない選択肢を指定された場合は、その項目の絞り込みを解除します。
-                for (Detail detail : Detail.values()) {
-                    String selected = detailFilters.get(detail);
-                    if (!selected.isEmpty() && !selected.equals("none")
-                            && !details.get(detail).containsKey(Integer.parseInt(selected))) {
-                        detailFilters.put(detail, "");
-                    }
-                }
+                Filters filters = readFilters(query);
+                retainKnownFilters(filters, filterOptions(genres, details, tags));
                 boolean expiredFolder = formValue(query, "folder").equals("expired");
-                List<Todo> todos = loadTodos(filter, expiredFolder ? "expired" : "", detailFilters, tagFilter);
+                List<Todo> todos = loadTodos(filters, expiredFolder ? "expired" : "");
                 // ★ 表示の組み立てだけをまとめ、既存のフォームと送信先を使います。
-                message = renderPage(todos, genres, filter, expiredFolder, details, detailFilters, tags, tagFilter);
+                message = renderPage(todos, genres, filters, expiredFolder, details, tags);
                 // トップページの応答はHTMLとして扱うよう伝えます。
                 exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
                 // 上記以外のパスへの返事を用意します。
@@ -317,6 +403,29 @@ public class App {
             exchange.getResponseBody().write(body);
             // 送信が終わったことを伝えて、応答を閉じます。
             exchange.getResponseBody().close();
+        });
+        // ★ 入力途中のTodoを送信せず、分類だけを登録して番号と名前を受け取ります。
+        server.createContext("/api/classifications", exchange -> {
+            if (!exchange.getRequestURI().getPath().equals("/api/classifications/create")) {
+                sendJson(exchange, 404, "{\"error\":\"ページが見つかりません\"}");
+                return;
+            }
+            if (!exchange.getRequestMethod().equals("POST")) {
+                exchange.getResponseHeaders().set("Allow", "POST");
+                sendJson(exchange, 405, "{\"error\":\"POSTで送信してください\"}");
+                return;
+            }
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            try {
+                Classification kind = classificationForKey(formValue(body, "type"));
+                if (kind == null) throw new IllegalArgumentException();
+                ClassificationItem item = createClassification(kind, formValue(body, "name"));
+                sendJson(exchange, 200, "{\"id\":" + item.id() + ",\"name\":\"" + escapeJson(item.name()) + "\"}");
+            } catch (IllegalArgumentException e) {
+                sendJson(exchange, 400, "{\"error\":\"分類名を入力してください。\"}");
+            } catch (IOException e) {
+                sendJson(exchange, 500, "{\"error\":\"登録できませんでした。もう一度お試しください。\"}");
+            }
         });
         // ★ GET /api/todosで全TodoをJSON形式（データ交換用の文字列）で返します。
         server.createContext("/api/todos", exchange -> { // ★ JSON用の入口を登録します。
@@ -344,97 +453,80 @@ public class App {
     }
 
     // ★ 画面だけを組み立てます。フォームの名前・送信先・保存処理は従来どおりです。
-    static String renderPage(List<Todo> todos, Map<Integer, String> genres, String filter, boolean expiredFolder,
-            Map<Detail, Map<Integer, String>> details, Map<Detail, String> detailFilters,
-            Map<Integer, String> tags, String tagFilter) {
+    static String renderPage(List<Todo> todos, Map<Integer, String> genres, Filters filters, boolean expiredFolder,
+            Map<Detail, Map<Integer, String>> details, Map<Integer, String> tags) {
         String folder = expiredFolder ? "expired" : "";
-        String hiddenFilter = "<input type='hidden' name='filter' value='" + filter
-                + "'><input type='hidden' name='folder' value='" + folder + "'>" + detailFilterInputs(detailFilters)
-                + "<input type='hidden' name='tagFilter' value='" + tagFilter + "'>";
-        String detailQuery = escapeHtml(detailFilterQuery(detailFilters)
-                + (tagFilter.isEmpty() ? "" : "&tagFilter=" + tagFilter));
-        int selectedGenre = filter.isEmpty() || filter.equals("none") ? 0 : Integer.parseInt(filter);
-        String currentGenre = filter.isEmpty() ? "すべて" : filter.equals("none") ? "未分類" : genres.get(selectedGenre);
-        // ★ 複数の条件を選んだ場合は、見出しの上に現在の条件を表示します。
-        for (Detail detail : Detail.values()) {
-            String selected = detailFilters.get(detail);
-            if (!selected.isEmpty()) {
-                currentGenre += " / " + detail.label + "："
-                        + (selected.equals("none") ? "未設定" : details.get(detail).get(Integer.parseInt(selected)));
+        String hiddenFilter = "<input type='hidden' name='folder' value='" + folder + "'>" + filters.hiddenInputs();
+        String filterQuery = filters.query().isEmpty() ? "" : "&amp;" + escapeHtml(filters.query());
+        Map<String, Map<String, String>> options = filterOptions(genres, details, tags);
+        int selectedGenre = singleFilterId(filters, "filter");
+        List<String> context = new ArrayList<>();
+        for (String[] field : FILTER_FIELDS) {
+            if (!filters.get(field[0]).isEmpty()) {
+                context.add(field[1] + "：" + filterSelectionLabel(filters.get(field[0]), options.get(field[0])));
             }
         }
-        if (!tagFilter.isEmpty()) {
-            currentGenre += " / タグ：" + (tagFilter.equals("none") ? "タグなし" : tags.get(Integer.parseInt(tagFilter)));
-        }
+        String currentContext = context.isEmpty() ? "すべて" : String.join(" / ", context);
         String html = "<!DOCTYPE html><html lang='ja'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>"
                 + (expiredFolder ? "期限切れ | ToDoリスト" : "ToDo") + "</title>";
         // ★ 指定フォントを読み込み、読み込めない場合は端末の標準フォントを使います。
         html += "<link rel='preconnect' href='https://fonts.googleapis.com'><link rel='preconnect' href='https://fonts.gstatic.com' crossorigin><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Noto+Sans+JP:wght@400;500;600&amp;display=swap' rel='stylesheet'><style>"
                 + pageStyles() + "</style></head><body><div class='workspace'>";
-        // ★ 左側には既存のカテゴリ絞り込みと登録フォームを縦に配置します。
+        // ★ サイドバーはナビゲーションと分類管理への入口にします。
         html += "<aside class='sidebar'><div class='brand'>" + uiIcon("list")
                 + "<span>ToDoリスト</span></div><div class='sidebar-body'>";
         html += "<nav class='folder-navigation' aria-label='Todoのフォルダ'><a class='folder-link"
                 + (!expiredFolder ? " is-selected" : "") + "'" + (!expiredFolder ? " aria-current='page'" : "")
-                + " href='" + escapeHtml(listLocation(filter, "", detailFilters, tagFilter)) + "'>" + uiIcon("list")
+                + " href='" + escapeHtml(listLocation(filters, "")) + "'>" + uiIcon("list")
                 + "Todo一覧</a><a class='folder-link" + (expiredFolder ? " is-selected" : "") + "'"
                 + (expiredFolder ? " aria-current='page'" : "") + " href='"
-                + escapeHtml(listLocation(filter, "expired", detailFilters, tagFilter)) + "'>" + uiIcon("folder") + "期限切れ</a></nav>";
+                + escapeHtml(listLocation(filters, "expired")) + "'>" + uiIcon("folder") + "期限切れ</a></nav>";
         // ★ 既存の絞り込みは、ポップアップのフィルタータブへ移します。
         html += "<div class='sidebar-section'><button type='button' class='button button-secondary filter-trigger' onclick=\"openOrganize('filter')\" aria-haspopup='dialog' aria-controls='organize-dialog'>"
                 + uiIcon("filter") + "フィルター</button></div>";
-        String filterForm = "<form id='list-filter-form' class='dialog-filter-form' method='get' action='/'><label class='field'><span class='field-label'>カテゴリ</span><select id='genre-filter' name='filter' aria-label='表示するカテゴリ'><option value=''>すべて</option><option value='none'"
-                + (filter.equals("none") ? " selected" : "") + ">未分類</option>";
-        for (Map.Entry<Integer, String> genre : genres.entrySet()) {
-            filterForm += "<option value='" + genre.getKey() + "'"
-                    + (filter.equals(genre.getKey().toString()) ? " selected" : "") + ">" + escapeHtml(genre.getValue())
-                    + "</option>";
-        }
-        filterForm += "</select></label>";
-        // ★ 新しい3項目も同じフォームで絞り込めます。条件はすべて同時に使えます。
-        for (Detail detail : Detail.values()) {
-            filterForm += "<div class='field'>" + detailFilterSelect(detail, details.get(detail), detailFilters.get(detail)) + "</div>";
-        }
-        filterForm += "<div class='field'>" + tagFilterSelect(tags, tagFilter) + "</div>";
-        filterForm += "<input type='hidden' name='folder' value='" + folder
-                + "'><a class='show-all' href='" + escapeHtml(listLocation("", folder)) + "'>すべて表示</a></form>";
-        html += "<section class='sidebar-section genre-registration'><h2 class='section-label'>カテゴリを登録</h2><form class='genre-form' method='post' action='/genres/add'><label class='field-label' for='new-genre'>カテゴリ名</label><input id='new-genre' name='name' placeholder='仕事・家事など' required>"
-                + hiddenFilter
-                + "<button class='button button-secondary'>カテゴリを登録</button></form></section>";
-        for (Detail detail : Detail.values()) {
-            html += "<details class='sidebar-section detail-registration'><summary>" + detail.label
-                    + "を登録</summary><form class='genre-form' method='post' action='/" + detail.table
-                    + "/add'><label class='field-label' for='new-" + detail.key + "'>" + detail.label
-                    + "名</label><input id='new-" + detail.key + "' name='name' placeholder='"
-                    + detail.placeholder + "' required>" + hiddenFilter
-                    + "<button class='button button-secondary'>" + detail.label + "を登録</button></form></details>";
-        }
-        html += "<details class='sidebar-section detail-registration'><summary>タグを登録</summary>"
-                + "<form class='genre-form' method='post' action='/tags/add'><label class='field-label' for='new-tag'>タグ名</label>"
-                + "<input id='new-tag' name='name' placeholder='確認待ち・買い物など' required>" + hiddenFilter
-                + "<button class='button button-secondary'>タグを登録</button></form></details></div></aside>";
+        String filterForm = filterAccordionForm(filters, options, folder);
+        html += classificationNav(null, filters, folder) + "</div></aside>";
         // ★ 右側は最大860pxの余白を持つメイン画面です。
         html += "<main class='main-pane'><div class='content'><header class='page-header'><p class='page-context'>"
-                + escapeHtml(currentGenre) + "</p><h1>" + (expiredFolder ? "期限切れ" : "ToDoリスト") + "</h1>";
+                + escapeHtml(currentContext) + "</p><h1>" + (expiredFolder ? "期限切れ" : "ToDoリスト") + "</h1>";
         if (expiredFolder) {
             html += "<p class='retention-note'>移動した日から30日後に自動削除されます。リストに戻すと期限は未登録になります。</p>";
         }
         html += "</header>";
         if (!expiredFolder) {
-            List<Integer> selectedTags = tagFilter.isEmpty() || tagFilter.equals("none")
-                    ? List.of() : List.of(Integer.parseInt(tagFilter));
-            html += "<section class='add-section' aria-labelledby='add-heading'><h2 id='add-heading' class='small-heading'>Todoを追加</h2><form class='add-form' method='post' action='/add'><label class='field'><span class='field-label'>やること</span><input name='todo' placeholder='やることを入力'></label>"
-                    + tagCheckboxes(tags, selectedTags) + "<label class='field'><span class='field-label'>カテゴリ</span>"
-                    + genreSelect(genres, selectedGenre) + "</label>";
-            for (Detail detail : Detail.values()) {
-                String selected = detailFilters.get(detail);
-                int selectedId = selected.isEmpty() || selected.equals("none") ? 0 : Integer.parseInt(selected);
-                html += "<label class='field'><span class='field-label'>" + detail.label + "</span>"
-                        + detailSelect(detail, details.get(detail), selectedId) + "</label>";
+            List<Integer> selectedTags = new ArrayList<>();
+            for (String id : filters.get("tagFilter")) selectedTags.add(Integer.parseInt(id));
+            // ★ 通常はタスク名と小さな設定チップだけを表示し、追加を独立した主操作にします。
+            html += "<section class='add-section' aria-labelledby='add-heading'><h2 id='add-heading' class='small-heading'>ToDoを追加</h2>"
+                    + "<form id='todo-add-form' class='add-form quick-add-form' method='post' action='/add'>"
+                    + "<label class='field task-name-field'><span class='sr-only'>やること</span><input name='todo' placeholder='やることを入力'></label>"
+                    + "<div class='quick-add-controls'><div class='quick-settings'>"
+                    + "<div class='quick-setting' data-quick-setting='category'><button type='button' id='quick-category-button' class='setting-chip' aria-expanded='false' aria-controls='quick-category-editor'>"
+                    + "<span class='chip-label'>カテゴリ：" + escapeHtml(selectedGenre == 0 ? "未分類" : genres.get(selectedGenre))
+                    + "</span></button>"
+                    + "<div id='quick-category-editor' class='quick-editor' role='group' aria-label='カテゴリを変更' hidden></div></div>"
+                    + "<div class='quick-setting' data-quick-setting='priority'><button type='button' id='quick-priority-button' class='setting-chip' aria-expanded='false' aria-haspopup='listbox' aria-controls='quick-priority-editor'>"
+                    + "<span class='chip-label'>重要度：中</span></button>"
+                    + "<div id='quick-priority-editor' class='quick-editor priority-editor' role='listbox' aria-label='重要度' hidden>";
+            for (String priority : List.of("高", "中", "低")) {
+                html += "<button type='button' role='option' data-priority='" + priority + "' aria-selected='"
+                        + priority.equals("中") + "' tabindex='-1'>" + priority + "</button>";
             }
-            html += "<label class='field'><span class='field-label'>重要度</span>"
-                    + prioritySelect("中") + "</label>" + hiddenFilter
-                    + "<button class='button button-primary'>" + uiIcon("plus") + "追加</button></form></section>";
+            html += "</div></div><button type='button' id='todo-details-toggle' class='details-toggle' aria-expanded='false' aria-controls='todo-add-details'>"
+                    + "詳細設定</button></div>"
+                    + "<button type='submit' class='button button-primary add-submit'>" + uiIcon("plus") + "追加</button></div>"
+                    + "<div class='configured-settings' aria-label='設定済みの項目' hidden></div>"
+                    + "<div id='todo-add-details' class='todo-add-details' role='region' aria-labelledby='todo-details-toggle' hidden><div class='add-details-grid'>"
+                    + "<div class='detail-slot' data-editor-slot='category'><div class='field' data-add-setting='category'><span class='field-label'>カテゴリ</span>"
+                    + genreSelect(genres, selectedGenre) + "</div></div>"
+                    + "<div class='detail-slot'><label class='field' data-add-setting='priority'><span class='field-label'>重要度</span>"
+                    + prioritySelect("中") + "</label></div><div class='detail-slot' data-add-setting='tag'>" + tagPicker(tags, selectedTags) + "</div>";
+            for (Detail detail : Detail.values()) {
+                int selectedId = singleFilterId(filters, detail.filterKey());
+                html += "<div class='detail-slot'><div class='field' data-add-setting='" + detail.key + "'><span class='field-label'>" + detail.label + "</span>"
+                        + detailSelect(detail, details.get(detail), selectedId) + "</div></div>";
+            }
+            html += "</div></div>" + hiddenFilter + "</form></section>";
         }
         // ★ 一覧の並び替えは、ポップアップで選んで決定する形にします。
         html += "<section class='list-section" + (expiredFolder ? " archived-list" : "") + "' aria-labelledby='list-heading'><div class='list-toolbar'><h2 id='list-heading'>一覧</h2><div class='list-order'><span id='current-sort' class='current-sort' aria-live='polite'>期限・昇順</span><button type='button' class='button button-secondary sort-trigger' onclick=\"openOrganize('sort')\" aria-haspopup='dialog' aria-controls='organize-dialog'>"
@@ -443,7 +535,7 @@ public class App {
         if (todos.isEmpty()) {
             html += "<li class='empty-state'>"
                     + (expiredFolder ? "期限切れのTodoはありません"
-                            : filter.isEmpty() && detailFilterQuery(detailFilters).isEmpty() && tagFilter.isEmpty()
+                            : !filters.active()
                                     ? "やることは、いまゼロです" : "この条件のTodoはありません")
                     + "</li>";
         } else {
@@ -464,9 +556,9 @@ public class App {
                             + "</span>";
                 } else {
                     html += "</div><form class='task-field task-genre' method='post' action='/genre' aria-label='カテゴリの変更'>"
-                            + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>カテゴリ</span>"
+                            + hiddenId + hiddenFilter + "<div class='control-label'>"
                             + genreSelect(genres, todo.getGenreId())
-                            + "</label><button class='save-button' aria-label='カテゴリを保存' title='カテゴリを保存'>保存</button></form>";
+                            + "</div><button class='save-button' aria-label='カテゴリを保存' title='カテゴリを保存'>保存</button></form>";
                     html += "<form class='task-field task-priority' method='post' action='/priority' aria-label='重要度の変更'>"
                             + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>重要度</span>"
                             + prioritySelect(todo.getPriority())
@@ -479,12 +571,12 @@ public class App {
                 }
                 html += "<div class='task-actions'>"
                         + (!expiredFolder
-                                ? "<a class='complete-link' href='/done?id=" + todo.getId() + "&amp;filter=" + filter + detailQuery
+                                ? "<a class='complete-link' href='/done?id=" + todo.getId() + filterQuery
                                         + "'>完了</a>"
                                 : "<form class='restore-form' method='post' action='/restore'>" + hiddenId + hiddenFilter
                                         + "<button class='restore-button' title='期限を未登録にして通常の一覧に戻します'>リストに戻す</button></form>")
-                        + "<a class='delete-link' href='/delete?id=" + todo.getId() + "&amp;filter=" + filter
-                        + "&amp;folder=" + folder + detailQuery + "' aria-label='削除' title='削除'>" + uiIcon("trash")
+                        + "<a class='delete-link' href='/delete?id=" + todo.getId()
+                        + "&amp;folder=" + folder + filterQuery + "' aria-label='削除' title='削除'>" + uiIcon("trash")
                         + "</a></div>";
                 // ★ 横幅を増やさず、各Todoの下段に場所・関係者・プロジェクトを並べます。
                 html += "<div class='task-details'>";
@@ -497,9 +589,9 @@ public class App {
                     } else {
                         html += "<form class='task-detail' method='post' action='/" + detail.key
                                 + "' aria-label='" + detail.label + "の変更'>" + hiddenId + hiddenFilter
-                                + "<label class='field'><span class='field-label'>" + detail.label + "</span>"
+                                + "<div class='field'><span class='field-label'>" + detail.label + "</span>"
                                 + detailSelect(detail, details.get(detail), todo.getDetailId(detail.key))
-                                + "</label><button class='save-button' aria-label='" + detail.label
+                                + "</div><button class='save-button' aria-label='" + detail.label
                                 + "を保存' title='" + detail.label + "を保存'>保存</button></form>";
                     }
                 }
@@ -508,21 +600,483 @@ public class App {
                             + tagNames(todo.getTags()) + "</div></div>";
                 } else {
                     html += "<form class='task-tags' method='post' action='/tags' aria-label='タグの変更'>"
-                            + hiddenId + hiddenFilter + tagCheckboxes(tags, new ArrayList<>(todo.getTags().keySet()))
+                            + hiddenId + hiddenFilter + tagPicker(tags, new ArrayList<>(todo.getTags().keySet()))
                             + "<button class='save-button' aria-label='タグを保存' title='タグを保存'>保存</button></form>";
                 }
                 html += "</div></li>";
             }
         }
         html += "</ul></section></div></main></div>";
-        html += organizeDialog(filterForm) + organizeScript() + "</body></html>";
+        html += organizeDialog(filterForm) + organizeScript()
+                + classificationBootstrap(genres, details, tags) + classificationScript() + quickAddScript() + "</body></html>";
         return html;
+    }
+
+    // ★ 保存形式やフォームの項目名は変えず、見た目を検索付きの共通選択欄にします。
+    static String classificationCombo(Classification kind, Map<Integer, String> options, List<Integer> selected) {
+        List<String> ids = new ArrayList<>();
+        String hidden = "";
+        for (int id : selected) {
+            if (options.containsKey(id)) {
+                ids.add(Integer.toString(id));
+                hidden += "<input type='hidden' name='" + kind.formName + "' value='" + id + "'>";
+            }
+        }
+        boolean multiple = kind == Classification.TAG;
+        if (!multiple && ids.isEmpty()) hidden = "<input type='hidden' name='" + kind.formName + "' value='0'>";
+        String value = multiple || ids.isEmpty() ? "" : options.get(Integer.parseInt(ids.get(0)));
+        return "<div class='classification-combo" + (multiple ? " is-multiple" : "") + "' data-kind='" + kind.key
+                + "' data-selected='" + String.join(",", ids) + "'><div class='combo-chips'></div>"
+                + "<div class='combo-entry'><input class='combo-input' type='text' role='combobox' aria-label='"
+                + kind.label + "' aria-autocomplete='list' aria-haspopup='listbox' aria-expanded='false' autocomplete='off' value='"
+                + escapeHtml(value) + "' placeholder='" + (multiple ? "タグを検索・新規登録" : kind.emptyLabel + "・検索")
+                + "'></div><div class='combo-popup' hidden>"
+                + "<div class='combo-list' role='listbox' aria-label='" + kind.label + "の候補'"
+                + (multiple ? " aria-multiselectable='true'" : "") + "></div><p class='combo-empty' hidden></p></div>"
+                + "<div class='combo-values'>" + hidden + "</div><p class='combo-notice' role='status' aria-live='polite'></p></div>";
+    }
+
+    // ★ 分類データをJavaScriptへ渡します。HTMLとして解釈される文字は文字コードに置き換えます。
+    static String classificationBootstrap(Map<Integer, String> genres, Map<Detail, Map<Integer, String>> details,
+            Map<Integer, String> tags) {
+        String json = "[";
+        for (Classification kind : Classification.values()) {
+            Map<Integer, String> options = kind == Classification.CATEGORY ? genres
+                    : kind == Classification.TAG ? tags : details.get(Detail.valueOf(kind.name()));
+            if (!json.equals("[")) json += ",";
+            json += "{\"key\":\"" + kind.key + "\",\"label\":\"" + kind.label + "\",\"formName\":\""
+                    + kind.formName + "\",\"emptyLabel\":\"" + kind.emptyLabel + "\",\"items\":[";
+            boolean first = true;
+            for (Map.Entry<Integer, String> option : options.entrySet()) {
+                if (!first) json += ",";
+                first = false;
+                json += "{\"id\":" + option.getKey() + ",\"name\":\"" + escapeJson(option.getValue()) + "\"}";
+            }
+            json += "]}";
+        }
+        json += "]";
+        json = json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026");
+        return "<script id='classification-data' type='application/json'>" + json + "</script>";
+    }
+
+    static String classificationLocation(Classification kind, Filters filters, String folder, String notice) {
+        String query = filters.query();
+        return "/classifications?type=" + kind.key + (query.isEmpty() ? "" : "&" + query)
+                + (folder.equals("expired") ? "&folder=expired" : "") + (notice.isEmpty() ? "" : "&notice=" + notice);
+    }
+
+    static String classificationNav(Classification selected, Filters filters, String folder) {
+        String html = "<section class='classification-navigation'><h2 class='section-label'>分類管理</h2><nav aria-label='分類管理'>";
+        for (Classification kind : Classification.values()) {
+            html += "<a class='folder-link" + (kind == selected ? " is-selected" : "") + "'"
+                    + (kind == selected ? " aria-current='page'" : "") + " href='"
+                    + escapeHtml(classificationLocation(kind, filters, folder, "")) + "'>" + kind.label + "</a>";
+        }
+        return html + "</nav></section>";
+    }
+
+    // ★ 編集・削除は独立した管理画面で行い、使用件数と解除される内容を表示します。
+    static String renderClassificationManagement(Classification kind, String notice, Filters filters, String folder) throws IOException {
+        List<ClassificationItem> items = loadClassificationItems(kind);
+        String back = escapeHtml(listLocation(filters, folder));
+        String hidden = filters.hiddenInputs() + "<input type='hidden' name='folder' value='"
+                + (folder.equals("expired") ? "expired" : "") + "'><input type='hidden' name='type' value='" + kind.key + "'>";
+        String impact = kind == Classification.TAG ? "このタグだけをTodoから解除します。"
+                : "使用中のTodoの" + kind.label + "は「" + kind.emptyLabel + "」に戻ります。";
+        String html = "<!DOCTYPE html><html lang='ja'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>"
+                + kind.label + "の管理 | ToDoリスト</title>"
+                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Noto+Sans+JP:wght@400;500;600&amp;display=swap' rel='stylesheet'><style>"
+                + pageStyles() + "</style></head><body><div class='workspace'><aside class='sidebar'><div class='brand'>"
+                + uiIcon("list") + "<span>ToDoリスト</span></div><div class='sidebar-body'><nav class='folder-navigation' aria-label='メインナビゲーション'>"
+                + "<a class='folder-link' href='" + back + "'>" + uiIcon("list") + "Todo一覧に戻る</a></nav>"
+                + classificationNav(kind, filters, folder) + "</div></aside><main class='main-pane'><div class='content'>"
+                + "<header class='page-header'><p class='page-context'>分類管理</p><h1>" + kind.label + "の管理</h1>"
+                + "<p class='retention-note'>新しい分類はTodoの入力欄から登録できます。名称変更は使用中のTodoにも反映されます。</p></header>";
+        String message = switch (notice) {
+            case "renamed" -> "名前を変更しました。";
+            case "deleted" -> "分類との関連付けを解除して削除しました。Todoは残っています。";
+            case "invalid" -> "変更できませんでした。名前の空欄・重複や、対象が存在するかを確認してください。";
+            case "error" -> "保存できませんでした。もう一度お試しください。";
+            default -> "";
+        };
+        if (!message.isEmpty()) html += "<p class='management-notice' role='status'>" + message + "</p>";
+        html += "<p class='management-impact'>" + impact + " Todo自体は削除しません。使用件数には期限切れフォルダも含みます。</p>"
+                + "<ul class='management-list'>";
+        for (ClassificationItem item : items) {
+            html += "<li class='management-row'><div class='management-item'><form class='rename-classification' method='post' action='/classifications/rename'>"
+                    + hidden + "<input type='hidden' name='id' value='" + item.id() + "'><label class='field'><span class='sr-only'>"
+                    + escapeHtml(item.name()) + "の名前</span><input name='name' value='" + escapeHtml(item.name())
+                    + "' required></label><button class='button button-secondary'>保存</button></form><p class='classification-usage'>使用中："
+                    + item.uses() + "件</p></div><form class='delete-classification' method='post' action='/classifications/delete'"
+                    + " data-name='" + escapeHtml(item.name()) + "' data-impact='" + escapeHtml(impact)
+                    + "' data-uses='" + item.uses() + "' onsubmit='return confirmClassificationDelete(this)'>" + hidden
+                    + "<input type='hidden' name='id' value='" + item.id() + "'><button class='button button-secondary' aria-label='"
+                    + escapeHtml(item.name()) + "を削除'>削除</button></form></li>";
+        }
+        if (items.isEmpty()) html += "<li class='empty-state'>登録済みの" + kind.label + "はありません。</li>";
+        return html + """
+                </ul></div></main></div><script>
+                function confirmClassificationDelete(form) {
+                    return window.confirm('「' + form.dataset.name + '」を削除します。使用中：' + form.dataset.uses
+                        + '件。' + form.dataset.impact + ' Todo自体は削除されません。削除しますか？');
+                }
+                </script></body></html>
+                """;
+    }
+
+    // ★ 同じ部品を各分類で使い、候補の検索・キーボード操作・その場での登録に対応します。
+    static String classificationScript() {
+        return """
+                <script>
+                (() => {
+                    const groups = new Map(JSON.parse(document.getElementById('classification-data').textContent).map(group => [group.key, group]));
+                    const widgets = [];
+                    const nameKey = value => value.normalize('NFKC').replace(/[\\s\\p{Z}]+/gu, ' ').trim().toLowerCase();
+                    const cleanName = value => value.replace(/[\\s\\p{Z}]+/gu, ' ').trim();
+
+                    // 登録した分類は、ほかの選択欄やフィルターからもすぐに使えるようにします。
+                    function addToFilters(group, item) {
+                        const key = group.key === 'category' ? 'filter' : group.key + 'Filter';
+                        const field = document.querySelector('[data-filter-group="' + key + '"] .filter-choices');
+                        if (!field) return;
+                        if (Array.from(field.querySelectorAll('input')).some(input => input.value === String(item.id))) return;
+                        field.querySelectorAll('.filter-help').forEach(note => note.remove());
+                        const label = document.createElement('label');
+                        label.className = 'filter-choice';
+                        const input = document.createElement('input');
+                        input.type = 'checkbox'; input.name = key; input.value = item.id;
+                        const text = document.createElement('span'); text.textContent = item.name;
+                        label.append(input, text); field.append(label);
+                    }
+
+                    document.querySelectorAll('.classification-combo').forEach((root, index) => {
+                        const group = groups.get(root.dataset.kind);
+                        const multiple = group.key === 'tag';
+                        const input = root.querySelector('.combo-input');
+                        const popup = root.querySelector('.combo-popup');
+                        const list = root.querySelector('.combo-list');
+                        const empty = root.querySelector('.combo-empty');
+                        const notice = root.querySelector('.combo-notice');
+                        const chips = root.querySelector('.combo-chips');
+                        const values = root.querySelector('.combo-values');
+                        list.id = 'classification-list-' + index;
+                        input.setAttribute('aria-controls', list.id);
+                        const state = {root, open: false, creating: false, query: '', active: -1, choices: [],
+                            selected: root.dataset.selected.split(',').filter(Boolean).map(Number)};
+                        widgets.push(state);
+                        const selectedName = () => group.items.find(item => item.id === state.selected[0])?.name || '';
+
+                        function renderSelection() {
+                            values.replaceChildren(); chips.replaceChildren();
+                            const ids = multiple ? state.selected : [state.selected[0] || 0];
+                            ids.forEach(id => {
+                                const hidden = document.createElement('input');
+                                hidden.type = 'hidden'; hidden.name = group.formName; hidden.value = id;
+                                values.append(hidden);
+                            });
+                            if (multiple) state.selected.forEach(id => {
+                                const item = group.items.find(item => item.id === id);
+                                if (!item) return;
+                                const chip = document.createElement('span'); chip.className = 'combo-chip';
+                                const name = document.createElement('span'); name.textContent = item.name;
+                                const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = '×';
+                                remove.setAttribute('aria-label', item.name + 'を解除');
+                                remove.addEventListener('click', () => {
+                                    state.selected = state.selected.filter(value => value !== id);
+                                    renderSelection(); input.focus({preventScroll: true});
+                                    if (state.open) renderOptions();
+                                });
+                                chip.append(name, remove); chips.append(chip);
+                            });
+                            if (!state.open) input.value = multiple ? '' : selectedName();
+                            input.title = multiple ? '' : selectedName();
+                            // ★ クイック表示にも、確定した選択だけを知らせます。
+                            root.dispatchEvent(new CustomEvent('classificationchange', {bubbles: true,
+                                detail: {kind: group.key, selected: state.selected.map(id => group.items.find(item => item.id === id)).filter(Boolean)}}));
+                        }
+
+                        function highlight(next, scroll) {
+                            state.active = next;
+                            Array.from(list.children).forEach((option, i) => option.classList.toggle('is-active', i === next));
+                            const option = list.children[next];
+                            if (option) {
+                                input.setAttribute('aria-activedescendant', option.id);
+                                if (scroll) option.scrollIntoView({block: 'nearest'});
+                            } else input.removeAttribute('aria-activedescendant');
+                        }
+
+                        function close() {
+                            state.open = false; state.query = ''; state.active = -1;
+                            popup.hidden = true; root.classList.remove('is-open');
+                            input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant');
+                            input.value = multiple ? '' : selectedName();
+                        }
+                        state.close = close;
+                        root.addEventListener('classification-close', close);
+
+                        function renderOptions() {
+                            const query = nameKey(state.query);
+                            const items = group.items.filter(item => nameKey(item.name).includes(query))
+                                .sort((a, b) => a.name.localeCompare(b.name, 'ja', {numeric: true}));
+                            state.choices = items.map(item => ({item}));
+                            if (!multiple && !query) state.choices.unshift({clear: true});
+                            if (query && !group.items.some(item => nameKey(item.name) === query)) state.choices.push({create: cleanName(state.query)});
+                            list.replaceChildren();
+                            state.choices.forEach((choice, i) => {
+                                const option = document.createElement('div');
+                                option.className = 'combo-option'; option.id = list.id + '-option-' + i;
+                                option.setAttribute('role', 'option');
+                                option.setAttribute('aria-selected', String(!!choice.item && state.selected.includes(choice.item.id)));
+                                option.textContent = choice.clear ? group.emptyLabel : choice.create
+                                    ? '＋「' + choice.create + '」を新規登録' : choice.item.name;
+                                if (choice.create) option.classList.add('combo-create');
+                                option.addEventListener('pointerdown', event => event.preventDefault());
+                                option.addEventListener('pointermove', () => highlight(i, false));
+                                option.addEventListener('click', () => choose(choice));
+                                list.append(option);
+                            });
+                            empty.hidden = !!query || !!items.length;
+                            empty.textContent = '登録済みの' + group.label + 'はありません。入力して新規登録できます。';
+                            let active = state.active;
+                            if (active < 0 && !query && !multiple) {
+                                active = state.choices.findIndex(choice => choice.item?.id === state.selected[0]);
+                            }
+                            highlight(Math.min(Math.max(active, 0), state.choices.length - 1), false);
+                        }
+                        state.renderOptions = renderOptions;
+
+                        function open() {
+                            widgets.forEach(widget => { if (widget !== state) widget.close(); });
+                            state.open = true; state.query = ''; state.active = -1;
+                            popup.hidden = false; root.classList.add('is-open'); input.setAttribute('aria-expanded', 'true');
+                            renderOptions();
+                        }
+
+                        function selectItem(item, forceAdd) {
+                            if (multiple) {
+                                if (state.selected.includes(item.id)) {
+                                    if (!forceAdd) state.selected = state.selected.filter(id => id !== item.id);
+                                } else state.selected.push(item.id);
+                                state.query = ''; input.value = ''; renderSelection();
+                                if (state.open) renderOptions();
+                            } else {
+                                state.selected = [item.id]; close(); renderSelection();
+                            }
+                        }
+
+                        async function choose(choice) {
+                            if (!choice || state.creating) return;
+                            notice.textContent = ''; notice.classList.remove('is-error');
+                            if (choice.clear) { state.selected = []; close(); renderSelection(); return; }
+                            if (choice.item) { selectItem(choice.item, false); return; }
+                            state.creating = true; input.readOnly = true; root.setAttribute('aria-busy', 'true');
+                            notice.textContent = '登録しています…';
+                            try {
+                                const response = await fetch('/api/classifications/create', {method: 'POST',
+                                    headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                                    body: new URLSearchParams({type: group.key, name: choice.create})});
+                                const item = await response.json();
+                                if (!response.ok) throw new Error(item.error || '登録できませんでした。');
+                                if (!group.items.some(value => value.id === item.id)) group.items.push(item);
+                                addToFilters(group, item);
+                                selectItem(item, true); notice.textContent = '';
+                            } catch (error) {
+                                notice.textContent = error.message || '登録できませんでした。もう一度お試しください。';
+                                notice.classList.add('is-error');
+                            } finally {
+                                state.creating = false; input.readOnly = false; root.removeAttribute('aria-busy');
+                            }
+                        }
+
+                        input.addEventListener('focus', () => { if (!state.open) { open(); input.select(); } });
+                        input.addEventListener('click', () => { if (!state.open) { open(); input.select(); } });
+                        input.addEventListener('input', () => {
+                            if (!state.open) open();
+                            state.query = input.value; state.active = 0; renderOptions();
+                        });
+                        input.addEventListener('keydown', event => {
+                            if (event.isComposing || event.keyCode === 229) return;
+                            if (event.key === 'Escape' && state.open) { event.preventDefault(); event.stopPropagation(); close(); }
+                            else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                                event.preventDefault();
+                                if (!state.open) open();
+                                const count = state.choices.length;
+                                if (count) highlight((state.active + (event.key === 'ArrowDown' ? 1 : -1) + count) % count, true);
+                            } else if (event.key === 'Enter') {
+                                event.preventDefault();
+                                if (!state.open) open(); else choose(state.choices[state.active]);
+                            } else if (event.key === 'Tab') close();
+                        });
+                        root.addEventListener('focusout', () => {
+                            setTimeout(() => { if (!root.contains(document.activeElement)) close(); }, 0);
+                        });
+                        renderSelection();
+                    });
+
+                    document.addEventListener('pointerdown', event => {
+                        widgets.forEach(widget => { if (!widget.root.contains(event.target)) widget.close(); });
+                    });
+                    // 分類入力中のEnterや、登録処理が終わる前のTodo送信を防ぎます。
+                    document.addEventListener('submit', event => {
+                        const pending = widgets.find(widget => event.target.contains(widget.root) && widget.creating);
+                        const typing = document.activeElement?.classList.contains('combo-input');
+                        if (pending || typing) {
+                            event.preventDefault();
+                            if (pending) pending.root.querySelector('.combo-notice').textContent = '分類の登録が終わるまでお待ちください。';
+                        }
+                    });
+                })();
+                </script>
+                """;
+    }
+
+    // ★ クイック登録と詳細設定で、同じ入力欄・同じ保存値を共有します。
+    static String quickAddScript() {
+        return """
+                <script>
+                (() => {
+                    const form = document.getElementById('todo-add-form');
+                    if (!form) return;
+                    const details = document.getElementById('todo-add-details');
+                    const toggle = document.getElementById('todo-details-toggle');
+                    const categoryField = form.querySelector('[data-add-setting="category"]');
+                    const categorySlot = form.querySelector('[data-editor-slot="category"]');
+                    const priority = form.querySelector('select[name="priority"]');
+                    const categoryButton = document.getElementById('quick-category-button');
+                    const priorityButton = document.getElementById('quick-priority-button');
+                    const categoryEditor = document.getElementById('quick-category-editor');
+                    const priorityEditor = document.getElementById('quick-priority-editor');
+                    const configured = form.querySelector('.configured-settings');
+                    const groups = new Map(JSON.parse(document.getElementById('classification-data').textContent).map(group => [group.key, group]));
+                    const selections = new Map();
+                    let quickKey = null;
+
+                    // 最初の選択も、保存に使う実際の入力値から読み取ります。
+                    form.querySelectorAll('.classification-combo').forEach(root => {
+                        const group = groups.get(root.dataset.kind);
+                        const ids = Array.from(root.querySelectorAll('.combo-values input')).map(input => Number(input.value));
+                        selections.set(group.key, group.items.filter(item => ids.includes(item.id)));
+                    });
+
+                    function closeQuick(restoreFocus) {
+                        const previous = quickKey;
+                        quickKey = null;
+                        categoryField.querySelector('.classification-combo').dispatchEvent(new Event('classification-close'));
+                        if (categoryField.parentElement !== categorySlot) categorySlot.append(categoryField);
+                        categoryEditor.hidden = true; priorityEditor.hidden = true;
+                        categoryButton.setAttribute('aria-expanded', 'false');
+                        priorityButton.setAttribute('aria-expanded', 'false');
+                        form.querySelectorAll('.quick-setting').forEach(root => root.classList.remove('is-open'));
+                        if (restoreFocus && previous) (previous === 'category' ? categoryButton : priorityButton).focus({preventScroll: true});
+                    }
+
+                    function updateViews() {
+                        const categoryName = selections.get('category')?.[0]?.name || '未分類';
+                        categoryButton.querySelector('.chip-label').textContent = 'カテゴリ：' + categoryName;
+                        categoryButton.title = 'カテゴリ：' + categoryName;
+                        priorityButton.querySelector('.chip-label').textContent = '重要度：' + priority.value;
+                        priorityEditor.querySelectorAll('[data-priority]').forEach(option => {
+                            const selected = option.dataset.priority === priority.value;
+                            option.setAttribute('aria-selected', String(selected)); option.tabIndex = selected ? 0 : -1;
+                        });
+                        configured.replaceChildren();
+                        for (const key of ['location', 'person', 'project', 'tag']) {
+                            for (const item of selections.get(key) || []) {
+                                const button = document.createElement('button');
+                                button.type = 'button'; button.className = 'setting-chip configured-chip';
+                                const label = groups.get(key).label + '：' + item.name;
+                                button.title = label; button.setAttribute('aria-label', label + 'を編集');
+                                const text = document.createElement('span'); text.className = 'chip-label'; text.textContent = label;
+                                button.append(text);
+                                button.addEventListener('click', () => {
+                                    setDetails(true);
+                                    form.querySelector('[data-kind="' + key + '"] .combo-input').focus();
+                                });
+                                configured.append(button);
+                            }
+                        }
+                        configured.hidden = !details.hidden || !configured.childElementCount;
+                    }
+
+                    function setDetails(expanded) {
+                        closeQuick(false);
+                        if (!expanded) {
+                            form.querySelectorAll('.classification-combo').forEach(root => root.dispatchEvent(new Event('classification-close')));
+                            if (details.contains(document.activeElement)) toggle.focus({preventScroll: true});
+                        }
+                        details.hidden = !expanded;
+                        toggle.setAttribute('aria-expanded', String(expanded));
+                        details.classList.toggle('is-expanding', expanded);
+                        updateViews();
+                    }
+                    details.addEventListener('animationend', () => details.classList.remove('is-expanding'));
+                    toggle.addEventListener('click', () => setDetails(details.hidden));
+
+                    categoryButton.addEventListener('click', () => {
+                        if (quickKey === 'category') { closeQuick(true); return; }
+                        closeQuick(false);
+                        if (!details.hidden) { categoryField.querySelector('.combo-input').focus(); return; }
+                        // 同じ入力欄を移動させるため、選択状態や作成途中の通信が二重になりません。
+                        categoryEditor.append(categoryField);
+                        categoryEditor.hidden = false; quickKey = 'category';
+                        categoryButton.setAttribute('aria-expanded', 'true');
+                        categoryButton.closest('.quick-setting').classList.add('is-open');
+                        categoryField.querySelector('.combo-input').focus();
+                    });
+                    priorityButton.addEventListener('click', () => {
+                        if (quickKey === 'priority') { closeQuick(true); return; }
+                        closeQuick(false); quickKey = 'priority'; priorityEditor.hidden = false;
+                        priorityButton.setAttribute('aria-expanded', 'true');
+                        priorityButton.closest('.quick-setting').classList.add('is-open');
+                        priorityEditor.querySelector('[data-priority="' + priority.value + '"]').focus();
+                    });
+                    priorityEditor.querySelectorAll('[data-priority]').forEach(option => {
+                        option.addEventListener('click', () => {
+                            priority.value = option.dataset.priority;
+                            priority.dispatchEvent(new Event('change', {bubbles: true}));
+                            closeQuick(true);
+                        });
+                    });
+                    priorityEditor.addEventListener('keydown', event => {
+                        if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+                        event.preventDefault();
+                        const options = Array.from(priorityEditor.querySelectorAll('[data-priority]'));
+                        const index = options.indexOf(document.activeElement);
+                        const next = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1
+                            : (index + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length;
+                        options.forEach((option, i) => option.tabIndex = i === next ? 0 : -1);
+                        options[next].focus();
+                    });
+                    priority.addEventListener('change', updateViews);
+                    form.addEventListener('classificationchange', event => {
+                        selections.set(event.detail.kind, event.detail.selected);
+                        updateViews();
+                        if (event.detail.kind === 'category' && quickKey === 'category') closeQuick(true);
+                    });
+                    document.addEventListener('pointerdown', event => {
+                        if (quickKey && !form.querySelector('[data-quick-setting="' + quickKey + '"]').contains(event.target)) closeQuick(false);
+                    });
+                    form.addEventListener('focusout', () => {
+                        setTimeout(() => {
+                            if (quickKey && !form.querySelector('[data-quick-setting="' + quickKey + '"]').contains(document.activeElement)) closeQuick(false);
+                        }, 0);
+                    });
+                    form.addEventListener('keydown', event => {
+                        if (event.key === 'Escape' && quickKey) {
+                            event.preventDefault(); event.stopPropagation(); closeQuick(true);
+                        }
+                    });
+                    updateViews();
+                })();
+                </script>
+                """;
     }
 
     // ★ 画像の配置に合わせ、ソートとフィルターを一つのポップアップにまとめます。
     static String organizeDialog(String filterForm) {
         String html = """
-                <dialog id='organize-dialog' class='organize-dialog' aria-labelledby='organize-title'>
+                <dialog id='organize-dialog' class='organize-overlay' aria-labelledby='organize-title'>
+                 <div class='organize-dialog'>
                   <h2 id='organize-title' class='sr-only'>並び替えとフィルター</h2>
                   <div class='organize-tabs' role='tablist' aria-label='一覧の表示設定'>
                     <button type='button' id='sort-tab' role='tab' aria-selected='true' aria-controls='sort-panel' onclick="showOrganizeTab('sort')">ソート</button>
@@ -551,6 +1105,7 @@ public class App {
                     <button type='button' class='button button-secondary' onclick="document.getElementById('organize-dialog').close()">キャンセル</button>
                     <button type='button' class='button button-primary' onclick='applyOrganize()'>決定</button>
                   </footer>
+                 </div>
                 </dialog>
                 """;
         return html;
@@ -575,6 +1130,7 @@ public class App {
                 function openOrganize(tab) {
                     // 前回キャンセルした選択は捨て、現在の設定から選び直します。
                     document.getElementById('list-filter-form').reset();
+                    updateFilterSummaries();
                     organizeDialog.querySelectorAll('[name="sortKey"]').forEach(input => {
                         input.checked = input.value === appliedSort.key;
                     });
@@ -646,7 +1202,33 @@ public class App {
                     organizeDialog.close();
                 }
 
-                organizeDialog.addEventListener('change', updateSortHelp);
+                function updateFilterSummaries() {
+                    document.querySelectorAll('#list-filter-form [data-filter-group]').forEach(group => {
+                        const selected = Array.from(group.querySelectorAll('input[type="checkbox"]:checked'))
+                            .filter(input => input.value !== '');
+                        const names = selected.map(input => input.parentElement.querySelector('span').textContent);
+                        const summary = group.querySelector('.filter-summary');
+                        summary.textContent = names.length > 1 ? names.length + '件選択' : names[0] || 'すべて';
+                        summary.title = names.length ? names.join('、') : 'すべて';
+                    });
+                }
+
+                // 「すべて」と個別条件を同時に選ばず、最後の条件を外したら「すべて」に戻します。
+                document.getElementById('list-filter-form').addEventListener('change', event => {
+                    const input = event.target;
+                    if (!input.matches('input[type="checkbox"]')) return;
+                    const group = input.closest('[data-filter-group]');
+                    if (!group) return;
+                    const choices = Array.from(group.querySelectorAll('input[type="checkbox"]'));
+                    const all = choices.find(choice => choice.value === '');
+                    const specific = choices.filter(choice => choice.value !== '');
+                    if (input === all && all.checked) specific.forEach(choice => choice.checked = false);
+                    all.checked = !specific.some(choice => choice.checked);
+                    updateFilterSummaries();
+                });
+                organizeDialog.addEventListener('change', event => {
+                    if (['sortKey', 'sortDirection'].includes(event.target.name)) updateSortHelp();
+                });
                 // 左右キーでも、画像上部のタブを切り替えられます。
                 organizeDialog.querySelector('[role="tablist"]').addEventListener('keydown', event => {
                     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -703,6 +1285,8 @@ public class App {
                 .detail-registration summary:focus-visible { outline: 3px solid #7D9B8340; outline-offset: 3px; }
                 .sidebar input, .sidebar select { width: 100%; font-size: 13px; }
                 .sidebar .button { width: 100%; min-height: 38px; font-size: 12px; }
+                .classification-navigation { margin-top: 32px; padding-top: 24px; border-top: 1px solid #DCE3DA; }
+                .classification-navigation nav { display: flex; flex-direction: column; gap: 4px; }
                 .main-pane { min-width: 0; padding: 64px 48px 96px; background: var(--main); }
                 .content { max-width: 860px; margin: 0 auto; }
                 .page-header { margin-bottom: 42px; }
@@ -713,8 +1297,31 @@ public class App {
                 h1 { font-size: 30px; font-weight: 600; letter-spacing: -.035em; line-height: 1.4; }
                 .small-heading { margin-bottom: 14px; font-size: 14px; font-weight: 500; }
                 .add-section { margin-bottom: 48px; }
-                .add-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; gap: 12px; }
-                .add-form .field:first-child { grid-column: 1 / -1; }
+                .add-form { display: flex; flex-direction: column; align-items: stretch; gap: 14px; }
+                .add-form > .field:first-child input { min-height: 48px; font-size: 16px; }
+                .quick-add-controls { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+                .quick-settings { display: flex; flex: 1; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+                .quick-setting { position: relative; max-width: 100%; }
+                .quick-setting.is-open { z-index: 80; }
+                .setting-chip { display: inline-flex; align-items: center; gap: 6px; max-width: min(280px, 100%); min-height: 34px; padding: 6px 10px; border: 1px solid #E2E7E1; border-radius: 999px; background: var(--background); color: #526658; font-size: 12px; line-height: 1.5; text-align: left; }
+                .setting-chip:hover { background: var(--selected); border-color: #C1D0BE; }
+                .chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                .details-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 10px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #65746A; font-size: 12px; }
+                .details-toggle:hover, .details-toggle[aria-expanded='true'] { background: var(--sidebar); }
+                .quick-add-controls .add-submit { flex: 0 0 auto; min-height: 38px; padding: 7px 15px; font-size: 13px; }
+                .quick-editor { position: absolute; top: calc(100% + 8px); left: 0; z-index: 80; width: min(320px, calc(100vw - 64px)); padding: 12px; border: 1px solid #DDE3DC; border-radius: 10px; background: var(--main); box-shadow: 0 4px 14px #242D2710; }
+                .quick-editor[hidden], .configured-settings[hidden], .todo-add-details[hidden] { display: none; }
+                .priority-editor { width: 140px; padding: 4px; }
+                .priority-editor [role='option'] { display: block; width: 100%; min-height: 34px; padding: 6px 10px; border: 0; border-radius: 6px; background: transparent; text-align: left; font-size: 14px; }
+                .priority-editor [role='option']:hover { background: var(--background); }
+                .priority-editor [aria-selected='true'] { background: var(--selected); }
+                .configured-settings { display: flex; flex-wrap: wrap; gap: 8px; }
+                .configured-chip { max-width: min(240px, 100%); background: var(--sidebar); border-color: transparent; }
+                .todo-add-details { margin-top: 6px; padding-top: 20px; border-top: 1px solid var(--line); overflow: visible; }
+                .add-details-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 20px; align-items: start; }
+                .detail-slot { min-width: 0; }
+                .todo-add-details.is-expanding { animation: quick-details-reveal 180ms ease-out; }
+                @keyframes quick-details-reveal { from { opacity: .35; } to { opacity: 1; } }
                 .field { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
                 .field-label { color: #718076; font-size: 12px; font-weight: 400; }
                 input, select { min-width: 0; min-height: 42px; padding: 8px 11px; border: 1px solid #DDE3DC; border-radius: 9px; background: var(--main); outline: none; }
@@ -732,8 +1339,11 @@ public class App {
                 .list-order { display: flex; align-items: center; gap: 12px; }
                 .current-sort { color: #718076; font-size: 12px; }
                 .sort-trigger { min-height: 36px; padding: 6px 12px; font-size: 12px; background: var(--main); }
-                .organize-dialog { width: min(520px, calc(100% - 32px)); max-height: calc(100vh - 48px); margin: auto; padding: 28px; overflow-y: auto; border: 1px solid #E2E7E1; border-radius: 16px; background: var(--main); color: var(--text); }
-                .organize-dialog::backdrop { background: #242D2740; }
+                /* 開閉に合わせて本体を伸ばし、画面を超えた分だけ外側全体で移動します。 */
+                .organize-overlay { position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 24px 16px; overflow-y: auto; border: 0; background: transparent; color: var(--text); }
+                .organize-overlay[open] { display: flex; flex-direction: column; }
+                .organize-overlay::backdrop { background: #242D2740; }
+                .organize-dialog { flex: 0 0 auto; width: min(520px, 100%); height: auto; max-height: none; margin: auto; padding: 28px; overflow: visible; border: 1px solid #E2E7E1; border-radius: 16px; background: var(--main); color: var(--text); }
                 .organize-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin-bottom: 26px; background: var(--sidebar); border-radius: 12px; }
                 .organize-tabs button { min-height: 42px; padding: 8px; border: 0; border-radius: 9px; background: transparent; font-size: 16px; font-weight: 500; }
                 .organize-tabs button:hover { background: #DDE5DA; }
@@ -752,9 +1362,26 @@ public class App {
                 .sort-choice input:checked + span { background: var(--selected); border-color: #C1D0BE; }
                 .sort-choice input:focus-visible + span { outline: 3px solid #7D9B8340; outline-offset: 3px; }
                 .sort-help { color: #718076; font-size: 12px; line-height: 1.8; }
-                .dialog-filter-form { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-                .dialog-filter-form select { width: 100%; }
-                .dialog-filter-form .show-all { align-self: end; justify-self: start; margin: 0; }
+                .dialog-filter-form { display: flex; flex-direction: column; gap: 20px; }
+                .dialog-filter-form .show-all { align-self: flex-start; margin: 0; }
+                .filter-accordion, .advanced-filters { min-width: 0; }
+                .filter-accordion > summary, .advanced-filters > summary { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 8px 12px; border-radius: 8px; list-style: none; cursor: pointer; }
+                .filter-accordion > summary { background: var(--sidebar); font-size: 16px; }
+                .filter-accordion > summary:hover { background: #DDE5DA; }
+                .filter-accordion > summary::-webkit-details-marker, .advanced-filters > summary::-webkit-details-marker { display: none; }
+                .filter-accordion > summary:focus-visible, .advanced-filters > summary:focus-visible { outline: 3px solid #7D9B8340; outline-offset: 3px; }
+                .filter-summary { min-width: 0; max-width: 52%; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #607166; font-size: 13px; }
+                .accordion-arrow { flex: 0 0 8px; width: 8px; height: 8px; margin: -4px 3px 0 2px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); }
+                .filter-accordion[open] > summary .accordion-arrow, .advanced-filters[open] > summary .accordion-arrow { margin-top: 4px; transform: rotate(225deg); }
+                .advanced-filters > summary { justify-content: space-between; margin-bottom: 2px; padding-inline: 10px; font-size: 18px; }
+                .advanced-filter-content { display: flex; flex-direction: column; gap: 20px; padding-top: 10px; padding-left: 10px; }
+                .filter-choices { display: flex; flex-direction: column; gap: 6px; min-width: 0; margin: 0; padding: 10px 10px 0; border: 0; }
+                .filter-choice { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 5px 8px; border-radius: 7px; font-size: 14px; cursor: pointer; }
+                .filter-choice:hover { background: var(--background); }
+                .filter-choice:has(input:checked) { background: #EAEEE980; }
+                .filter-choice input[type='checkbox'] { flex: 0 0 16px; width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; accent-color: var(--accent); }
+                .filter-choice span { min-width: 0; overflow-wrap: anywhere; }
+                .filter-help { color: #718076; font-size: 12px; line-height: 1.8; }
                 .organize-footer { display: flex; justify-content: flex-end; gap: 12px; margin-top: 32px; }
                 .organize-footer .button { min-width: 112px; }
                 .column-headings, .task-row { display: grid; grid-template-columns: minmax(0, 1fr) 144px 100px 190px 78px; gap: 12px; align-items: center; }
@@ -771,6 +1398,40 @@ public class App {
                 .task-details { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding-top: 4px; }
                 .task-detail { display: flex; align-items: flex-end; gap: 6px; min-width: 0; }
                 .task-detail .field { flex: 1; }
+                .classification-combo { position: relative; width: 100%; min-width: 0; }
+                .classification-combo.is-open { z-index: 40; }
+                .combo-entry { position: relative; }
+                .combo-input { width: 100%; text-overflow: ellipsis; }
+                .combo-popup { position: absolute; top: calc(100% + 6px); left: 0; z-index: 50; width: max-content; min-width: max(100%, 210px); max-width: min(360px, calc(100vw - 64px)); padding: 5px; border: 1px solid #DDE3DC; border-radius: 10px; background: var(--main); box-shadow: 0 4px 14px #242D2710; }
+                .combo-popup[hidden] { display: none; }
+                .combo-list { max-height: 230px; overflow-y: auto; overscroll-behavior: contain; }
+                .combo-option { padding: 8px 10px; border-radius: 6px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; cursor: pointer; }
+                .combo-option[aria-selected='true'] { background: #EAEEE9; font-weight: 500; }
+                .combo-option.is-active { background: var(--selected); }
+                .combo-create { color: #45614C; }
+                .combo-empty, .combo-notice { padding: 4px 5px; color: #718076; font-size: 12px; overflow-wrap: anywhere; }
+                .combo-notice:empty { display: none; }
+                .combo-notice.is-error { color: #8A493B; }
+                .combo-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 7px; }
+                .combo-chips:empty { display: none; }
+                .combo-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 2px 4px 2px 8px; border-radius: 8px; background: var(--selected); font-size: 12px; }
+                .combo-chip > span { min-width: 0; overflow-wrap: anywhere; }
+                .combo-chip button { flex: 0 0 24px; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: #516657; }
+                .combo-chip button:hover { background: #BECDBB; }
+                .task-field .combo-input, .task-detail .combo-input, .task-tags .combo-input { min-height: 34px; height: 34px; padding: 5px 6px; border-color: #E5EAE3; border-radius: 8px; font-size: 12px; }
+                .tag-picker { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+                .add-form > .tag-picker { grid-column: 1 / -1; }
+                .task-tags > .tag-picker { flex: 1; }
+                .management-notice { margin-bottom: 20px; padding: 12px 14px; background: var(--sidebar); border-radius: 9px; font-size: 14px; }
+                .management-impact { margin-bottom: 24px; color: #718076; font-size: 13px; }
+                .management-list { padding: 0; list-style: none; border-top: 1px solid var(--line); }
+                .management-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+                .management-item { min-width: 0; }
+                .rename-classification { display: flex; align-items: center; gap: 10px; }
+                .rename-classification .field { flex: 1; }
+                .rename-classification input { width: 100%; }
+                .classification-usage { margin-top: 6px; color: #718076; font-size: 12px; }
+                .delete-classification .button { color: #7D6358; }
                 .detail-value { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
                 .tag-options { min-width: 0; margin: 0; padding: 0; border: 0; }
                 .tag-options legend { margin-bottom: 7px; padding: 0; color: #718076; font-size: 12px; }
@@ -812,24 +1473,28 @@ public class App {
                     .task-priority { grid-column: 4 / span 3; grid-row: 2; }
                     .task-deadline { grid-column: 1 / -1; grid-row: 3; }
                     .task-details { grid-row: 4; grid-template-columns: minmax(0, 1fr); gap: 12px; }
-                    .add-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-                    .add-form .field:first-child { grid-column: 1 / -1; }
-                    .add-form .button { grid-column: 1 / -1; }
                 }
                 @media (max-width: 700px) {
                     .workspace { display: block; }
                     .sidebar { position: static; height: auto; padding: 24px; border-right: 0; border-bottom: 1px solid #E2E7E1; }
                     .sidebar-body { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 28px; }
                     .folder-navigation { grid-column: 1 / -1; margin-bottom: 0; }
+                    .classification-navigation { margin-top: 0; grid-column: 1 / -1; }
+                    .classification-navigation nav { display: grid; grid-template-columns: 1fr 1fr; }
+                    .management-row { grid-template-columns: 1fr; }
+                    .delete-classification { justify-self: end; }
                     .detail-registration { margin-top: 0; }
                     .genre-registration { margin: 0; padding: 0; border: 0; }
                     .main-pane { padding: 36px 24px 64px; }
+                    .quick-add-controls { align-items: flex-start; }
+                    .add-details-grid { grid-template-columns: minmax(0, 1fr); }
                     .page-header { margin-bottom: 32px; }
                     h1 { font-size: 26px; }
                     .list-toolbar { align-items: flex-start; flex-direction: column; }
                 }
                 @media (prefers-reduced-motion: reduce) {
                     button, a, input, select, .sort-choice span { transition: none; }
+                    .todo-add-details.is-expanding { animation: none; }
                 }
                 """;
     }
@@ -848,6 +1513,143 @@ public class App {
         };
         return "<svg class='icon' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true'>"
                 + shape + "</svg>";
+    }
+
+    static Classification classificationForKey(String key) {
+        for (Classification kind : Classification.values()) if (kind.key.equals(key)) return kind;
+        return null;
+    }
+
+    // ★ 表示名の余分な空白を取り除き、比較用の名前では全角・半角と英字の大小も揃えます。
+    static String cleanClassificationName(String name) {
+        return name.replaceAll("[\\p{Z}\\s]+", " ").strip();
+    }
+
+    static String classificationNameKey(String name) {
+        return cleanClassificationName(Normalizer.normalize(name, Normalizer.Form.NFKC)).toLowerCase(Locale.ROOT);
+    }
+
+    static ClassificationItem findClassification(Connection connection, Classification kind, String name) throws SQLException {
+        String key = classificationNameKey(name);
+        try (PreparedStatement statement = connection.prepareStatement("SELECT id, name FROM " + kind.table + " ORDER BY id");
+                ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                if (classificationNameKey(result.getString("name")).equals(key)) {
+                    return new ClassificationItem(result.getInt("id"), result.getString("name"), 0);
+                }
+            }
+        }
+        return null;
+    }
+
+    // ★ 同じ名前があればその番号を返します。既存の番号やTodoとの対応は変えません。
+    static synchronized ClassificationItem createClassification(Classification kind, String rawName) throws IOException {
+        String name = cleanClassificationName(rawName);
+        if (name.isEmpty()) throw new IllegalArgumentException("名前を入力してください");
+        try (Connection connection = openDatabase()) {
+            connection.setAutoCommit(false);
+            try {
+                ClassificationItem existing = findClassification(connection, kind, name);
+                if (existing != null) {
+                    connection.commit();
+                    return existing;
+                }
+                try (PreparedStatement statement = connection.prepareStatement("INSERT INTO " + kind.table + " (name) VALUES (?)")) {
+                    statement.setString(1, name);
+                    statement.executeUpdate();
+                }
+                int id;
+                try (Statement statement = connection.createStatement(); ResultSet result = statement.executeQuery("SELECT last_insert_rowid()")) {
+                    result.next();
+                    id = result.getInt(1);
+                }
+                connection.commit();
+                return new ClassificationItem(id, name, 0);
+            } catch (SQLException e) {
+                connection.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw new IOException(e);
+        }
+    }
+
+    // ★ 名前だけを変えるため、その分類を使用するすべてのTodoにも次の表示時に反映されます。
+    static synchronized void renameClassification(Classification kind, int id, String rawName) throws IOException {
+        String name = cleanClassificationName(rawName);
+        if (id <= 0 || name.isEmpty()) throw new IllegalArgumentException();
+        try (Connection connection = openDatabase()) {
+            connection.setAutoCommit(false);
+            try {
+                ClassificationItem existing = findClassification(connection, kind, name);
+                if (existing != null && existing.id() != id) throw new IllegalArgumentException("同じ名前が登録済みです");
+                try (PreparedStatement statement = connection.prepareStatement("UPDATE " + kind.table + " SET name = ? WHERE id = ?")) {
+                    statement.setString(1, name);
+                    statement.setInt(2, id);
+                    if (statement.executeUpdate() != 1) throw new IllegalArgumentException();
+                }
+                connection.commit();
+            } catch (SQLException | IllegalArgumentException e) {
+                connection.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw new IOException(e);
+        }
+    }
+
+    // ★ Todo本体は残し、分類との対応を解除してから分類だけを削除します。
+    static synchronized void deleteClassification(Classification kind, int id) throws IOException {
+        if (id <= 0) throw new IllegalArgumentException();
+        try (Connection connection = openDatabase()) {
+            connection.setAutoCommit(false);
+            try {
+                if (kind == Classification.TAG) {
+                    try (PreparedStatement statement = connection.prepareStatement("DELETE FROM todo_tags WHERE tag_id = ?")) {
+                        statement.setInt(1, id);
+                        statement.executeUpdate();
+                    }
+                } else {
+                    try (PreparedStatement statement = connection.prepareStatement("UPDATE todos SET " + kind.column + " = NULL WHERE " + kind.column + " = ?")) {
+                        statement.setInt(1, id);
+                        statement.executeUpdate();
+                    }
+                }
+                try (PreparedStatement statement = connection.prepareStatement("DELETE FROM " + kind.table + " WHERE id = ?")) {
+                    statement.setInt(1, id);
+                    if (statement.executeUpdate() != 1) throw new IllegalArgumentException();
+                }
+                connection.commit();
+            } catch (SQLException | IllegalArgumentException e) {
+                connection.rollback();
+                throw e;
+            }
+        } catch (SQLException e) {
+            throw new IOException(e);
+        }
+    }
+
+    // ★ 使用中の件数には期限切れフォルダのTodoも含め、削除の影響を明示します。
+    static List<ClassificationItem> loadClassificationItems(Classification kind) throws IOException {
+        List<ClassificationItem> items = new ArrayList<>();
+        String sql = kind == Classification.TAG
+                ? "SELECT c.id, c.name, COUNT(t.todo_id) AS uses FROM tags c LEFT JOIN todo_tags t ON t.tag_id = c.id GROUP BY c.id ORDER BY c.name, c.id"
+                : "SELECT c.id, c.name, COUNT(t.id) AS uses FROM " + kind.table + " c LEFT JOIN todos t ON t." + kind.column + " = c.id GROUP BY c.id ORDER BY c.name, c.id";
+        try (Connection connection = openDatabase(); PreparedStatement statement = connection.prepareStatement(sql);
+                ResultSet result = statement.executeQuery()) {
+            while (result.next()) items.add(new ClassificationItem(result.getInt("id"), result.getString("name"), result.getInt("uses")));
+        } catch (SQLException e) {
+            throw new IOException(e);
+        }
+        return items;
+    }
+
+    static void sendJson(HttpExchange exchange, int status, String json) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(status, body.length);
+        exchange.getResponseBody().write(body);
+        exchange.close();
     }
 
     // ★ 関連するTodoを削除したとき、タグとの対応も自動で片付く接続にします。
@@ -1061,30 +1863,13 @@ public class App {
     // ★変更 SELECT文でデータベースからTodo一覧を読み込みます。
 
     static List<Todo> loadTodos() throws IOException { // ★ Todo一覧を読むメソッドです。
-        return loadTodos("", "all"); // ★ JSON用の入口では保管中を含む全件を返します。
+        return loadTodos(new Filters(), "all"); // ★ JSON用の入口では保管中を含む全件を返します。
     }
 
-    // ★ カテゴリを選んだ場合だけ、保存先で絞り込んで読みます。
-    static List<Todo> loadTodos(String filter) throws IOException {
-        return loadTodos(filter, "");
-    }
-
-    // ★ 通常一覧と期限切れフォルダを分けて読み込みます。
-    static List<Todo> loadTodos(String filter, String folder) throws IOException {
-        return loadTodos(filter, folder, Map.of());
-    }
-
-    // ★ カテゴリと新しい3項目の条件を、すべて満たすTodoを読み込みます。
-    static List<Todo> loadTodos(String filter, String folder, Map<Detail, String> detailFilters) throws IOException {
-        return loadTodos(filter, folder, detailFilters, "");
-    }
-
-    // ★ タグの条件も合わせ、同じTodoが重複しないように読み込みます。
-    static List<Todo> loadTodos(String filter, String folder, Map<Detail, String> detailFilters,
-            String tagFilter) throws IOException {
+    // ★ 同じ項目の選択はOR（どれか）、別項目の条件はAND（すべて）で検索します。
+    static List<Todo> loadTodos(Filters filters, String folder) throws IOException {
         maintainExpiredTodos();
-        filter = normalizedFilter(filter);
-        tagFilter = normalizedFilter(tagFilter);
+        List<Object> parameters = new ArrayList<>();
         List<Todo> todos = new ArrayList<>(); // ★ 読み込んだTodoを入れる一覧です。
         String sql = "SELECT t.id, t.title, t.done, t.deadline, t.genre_id, t.expired_on, t.priority, g.name AS genre_name";
         for (Detail detail : Detail.values()) {
@@ -1101,40 +1886,45 @@ public class App {
         } else if (!folder.equals("all")) {
             sql += " AND t.expired_on IS NULL";
         }
-        if (filter.equals("none")) {
-            sql += " AND t.genre_id IS NULL";
-        } else if (!filter.isEmpty()) {
-            sql += " AND t.genre_id = ?";
+        List<Integer> statuses = new ArrayList<>();
+        for (String status : filters.get("statusFilter")) {
+            statuses.add(status.equals("done") ? 1 : 0);
         }
+        sql += inFilter("COALESCE(t.done, 0)", statuses, parameters);
+        sql += inFilter("t.priority", filters.get("priorityFilter"), parameters);
+        sql += inFilter("t.genre_id", filterIds(filters, "filter"), parameters);
         for (Detail detail : Detail.values()) {
-            String selected = normalizedFilter(detailFilters.getOrDefault(detail, ""));
-            if (selected.equals("none")) {
-                sql += " AND t." + detail.column + " IS NULL";
-            } else if (!selected.isEmpty()) {
-                sql += " AND t." + detail.column + " = ?";
+            sql += inFilter("t." + detail.column, filterIds(filters, detail.filterKey()), parameters);
+        }
+        if (!filters.get("tagFilter").isEmpty()) {
+            // ★ タグは選んだもののどれか一つが付いていれば一致し、Todoを重複表示しません。
+            sql += " AND EXISTS (SELECT 1 FROM todo_tags tt WHERE tt.todo_id = t.id"
+                    + inFilter("tt.tag_id", filterIds(filters, "tagFilter"), parameters) + ")";
+        }
+        LocalDate today = LocalDate.now(ZoneId.of("Asia/Tokyo"));
+        List<String> deadlines = new ArrayList<>();
+        for (String choice : filters.get("deadlineFilter")) {
+            if (choice.equals("today")) {
+                deadlines.add("t.deadline = ?");
+                parameters.add(today.toString());
+            } else if (choice.equals("week")) {
+                deadlines.add("(t.deadline >= ? AND t.deadline <= ?)");
+                parameters.add(today.toString());
+                parameters.add(today.plusDays(7).toString());
+            } else if (choice.equals("later")) {
+                deadlines.add("t.deadline > ?");
+                parameters.add(today.plusDays(7).toString());
             }
         }
-        if (tagFilter.equals("none")) {
-            sql += " AND NOT EXISTS (SELECT 1 FROM todo_tags tt WHERE tt.todo_id = t.id)";
-        } else if (!tagFilter.isEmpty()) {
-            sql += " AND EXISTS (SELECT 1 FROM todo_tags tt WHERE tt.todo_id = t.id AND tt.tag_id = ?)";
+        if (!deadlines.isEmpty()) {
+            sql += " AND (" + String.join(" OR ", deadlines) + ")";
         }
         // ★ 未登録を後ろにし、期限が近い順、同じ期限なら番号順に読み込みます。
         sql += " ORDER BY CASE WHEN t.deadline IS NULL OR t.deadline = '' THEN 1 ELSE 0 END, t.deadline ASC, t.id ASC";
         try (Connection connection = openDatabase();
                 PreparedStatement statement = connection.prepareStatement(sql)) {
-            int parameter = 1;
-            if (!filter.isEmpty() && !filter.equals("none")) {
-                statement.setInt(parameter++, Integer.parseInt(filter));
-            }
-            for (Detail detail : Detail.values()) {
-                String selected = normalizedFilter(detailFilters.getOrDefault(detail, ""));
-                if (!selected.isEmpty() && !selected.equals("none")) {
-                    statement.setInt(parameter++, Integer.parseInt(selected));
-                }
-            }
-            if (!tagFilter.isEmpty() && !tagFilter.equals("none")) {
-                statement.setInt(parameter, Integer.parseInt(tagFilter));
+            for (int i = 0; i < parameters.size(); i++) {
+                statement.setObject(i + 1, parameters.get(i));
             }
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) { // ★ 結果を1行ずつ読みます。
@@ -1158,6 +1948,23 @@ public class App {
         } // ★ 接続を閉じます。
         return todos; // ★ 読み込んだ一覧を返します。
     } // ★ 一覧の読み込みを終えます。
+
+    // ★ INは「この一覧のどれかに一致」という検索条件です。値はSQLへ別に渡します。
+    static String inFilter(String column, List<?> selected, List<Object> parameters) {
+        if (selected.isEmpty()) return "";
+        List<String> placeholders = new ArrayList<>();
+        for (Object value : selected) {
+            placeholders.add("?");
+            parameters.add(value);
+        }
+        return " AND " + column + " IN (" + String.join(",", placeholders) + ")";
+    }
+
+    static List<Integer> filterIds(Filters filters, String key) {
+        List<Integer> ids = new ArrayList<>();
+        for (String value : filters.get(key)) ids.add(Integer.parseInt(value));
+        return ids;
+    }
       // ★ 送られたフォームの中から指定した名前の値をUTF-8で取り出します。
 
     static String formValue(String body, String name) {
@@ -1185,50 +1992,139 @@ public class App {
         return id;
     }
 
-    // ★ 絞り込み値は「すべて」「未分類」「正のカテゴリ番号」に限定します。
-    static String normalizedFilter(String filter) {
-        if (filter.equals("none")) {
-            return "none";
+    // ★ 選択を複数受け取り、項目ごとに同じ値を一つへまとめます。
+    static Filters readFilters(String source) {
+        Filters filters = new Filters();
+        for (String[] field : FILTER_FIELDS) {
+            String key = field[0];
+            List<String> received = formValues(source, key);
+            List<String> selected = new ArrayList<>();
+            if (!received.contains("")) {
+                for (String value : received) {
+                    boolean valid;
+                    switch (key) {
+                        case "statusFilter" -> valid = List.of("done", "undone").contains(value);
+                        case "priorityFilter" -> valid = List.of("高", "中", "低").contains(value);
+                        case "deadlineFilter" -> valid = List.of("today", "week", "later").contains(value);
+                        default -> {
+                            try {
+                                int id = Integer.parseInt(value);
+                                valid = id > 0;
+                                value = Integer.toString(id);
+                            } catch (NumberFormatException e) {
+                                valid = false;
+                            }
+                        }
+                    }
+                    if (valid && !selected.contains(value)) selected.add(value);
+                }
+            }
+            filters.values.put(key, selected);
         }
-        try {
-            int id = readGenreId(filter);
-            return id == 0 ? "" : Integer.toString(id);
-        } catch (NumberFormatException e) {
-            return "";
-        }
+        return filters;
     }
 
-    // ★ 各操作の後も同じカテゴリの一覧へ戻します。
-    static String listLocation(String filter) {
-        return listLocation(filter, "");
-    }
-
-    // ★ 削除や絞り込みの後も、同じフォルダへ戻ります。
-    static String listLocation(String filter, String folder) {
-        return listLocation(filter, folder, Map.of());
-    }
-
-    // ★ 追加・変更・完了・削除・復帰の後も、新しい絞り込み条件を維持します。
-    static String listLocation(String filter, String folder, Map<Detail, String> detailFilters) {
-        return listLocation(filter, folder, detailFilters, "");
-    }
-
-    // ★ 各操作のあとも、選択したタグの絞り込み条件を維持します。
-    static String listLocation(String filter, String folder, Map<Detail, String> detailFilters, String tagFilter) {
-        filter = normalizedFilter(filter);
-        String query = filter.isEmpty() ? "" : "filter=" + filter;
+    // ★ 各操作のあとも、全項目の複数選択と表示中のフォルダを維持します。
+    static String listLocation(Filters filters, String folder) {
+        String query = filters.query();
         if (folder.equals("expired")) {
             query += (query.isEmpty() ? "" : "&") + "folder=expired";
         }
-        String detailQuery = detailFilterQuery(detailFilters);
-        if (!detailQuery.isEmpty()) {
-            query += query.isEmpty() ? detailQuery.substring(1) : detailQuery;
-        }
-        tagFilter = normalizedFilter(tagFilter);
-        if (!tagFilter.isEmpty()) {
-            query += (query.isEmpty() ? "" : "&") + "tagFilter=" + tagFilter;
-        }
         return query.isEmpty() ? "/" : "/?" + query;
+    }
+
+    // ★ カテゴリなどの番号と名前を、チェック欄で使う文字列の対応表へ変えます。
+    static Map<String, String> namedIdOptions(Map<Integer, String> source) {
+        Map<String, String> options = new LinkedHashMap<>();
+        for (Map.Entry<Integer, String> entry : source.entrySet()) {
+            options.put(entry.getKey().toString(), entry.getValue());
+        }
+        return options;
+    }
+
+    static Map<String, String> namedOptions(String... pairs) {
+        Map<String, String> options = new LinkedHashMap<>();
+        for (int i = 0; i < pairs.length; i += 2) options.put(pairs[i], pairs[i + 1]);
+        return options;
+    }
+
+    // ★ 「すべて」に続く項目は、固定の条件か、ユーザーが登録した名前だけにします。
+    static Map<String, Map<String, String>> filterOptions(Map<Integer, String> genres,
+            Map<Detail, Map<Integer, String>> details, Map<Integer, String> tags) {
+        Map<String, Map<String, String>> options = new LinkedHashMap<>();
+        options.put("statusFilter", namedOptions("done", "完了", "undone", "未完了"));
+        options.put("priorityFilter", namedOptions("高", "高", "中", "中", "低", "低"));
+        options.put("deadlineFilter", namedOptions("today", "今日", "week", "一週間以内", "later", "それ以降"));
+        options.put("filter", namedIdOptions(genres));
+        for (Detail detail : Detail.values()) options.put(detail.filterKey(), namedIdOptions(details.get(detail)));
+        options.put("tagFilter", namedIdOptions(tags));
+        return options;
+    }
+
+    // ★ 削除済みなど、存在しない選択肢は引き継ぎません。
+    static void retainKnownFilters(Filters filters, Map<String, Map<String, String>> options) {
+        for (String[] field : FILTER_FIELDS) {
+            List<String> selected = new ArrayList<>();
+            for (String value : filters.get(field[0])) {
+                if (options.get(field[0]).containsKey(value)) selected.add(value);
+            }
+            filters.values.put(field[0], selected);
+        }
+    }
+
+    // ★ 分類を一つに絞っているときだけ、追加フォームでもその分類を選んでおきます。
+    static int singleFilterId(Filters filters, String key) {
+        return filters.get(key).size() == 1 ? Integer.parseInt(filters.get(key).get(0)) : 0;
+    }
+
+    static String filterSelectionLabel(List<String> selected, Map<String, String> options) {
+        if (selected.isEmpty()) return "すべて";
+        List<String> names = new ArrayList<>();
+        for (String value : selected) names.add(options.get(value));
+        return String.join("、", names);
+    }
+
+    // ★ 詳細フィルターの中にも、場所などを個別に開く欄を入れます。
+    static String filterAccordionForm(Filters filters, Map<String, Map<String, String>> options, String folder) {
+        String html = "<form id='list-filter-form' class='dialog-filter-form' method='get' action='/'>";
+        for (int i = 0; i < 4; i++) {
+            String[] field = FILTER_FIELDS[i];
+            html += filterAccordion(field[0], field[1], options.get(field[0]), filters.get(field[0]));
+        }
+        html += "<details class='advanced-filters'><summary><span>詳細フィルター</span><span class='accordion-arrow' aria-hidden='true'></span></summary><div class='advanced-filter-content'>";
+        for (int i = 4; i < FILTER_FIELDS.length; i++) {
+            String[] field = FILTER_FIELDS[i];
+            html += filterAccordion(field[0], field[1], options.get(field[0]), filters.get(field[0]));
+        }
+        html += "</div></details><p class='filter-help'>同じ項目はどれかに一致、別の項目はすべての条件に一致するTodoを表示します。</p>"
+                + "<input type='hidden' name='folder' value='" + folder + "'>"
+                + "<a class='show-all' href='" + escapeHtml(listLocation(new Filters(), folder)) + "'>すべて表示</a></form>";
+        return html;
+    }
+
+    // ★ アコーディオン（押すと開閉する欄）に、複数選択できるチェック欄を入れます。
+    static String filterAccordion(String key, String label, Map<String, String> options, List<String> selected) {
+        String html = "<details class='filter-accordion' data-filter-group='" + key + "'><summary><span>"
+                + label + "</span><span class='filter-summary' title='"
+                + escapeHtml(filterSelectionLabel(selected, options)) + "'>"
+                + escapeHtml(selected.size() > 1 ? selected.size() + "件選択" : filterSelectionLabel(selected, options))
+                + "</span><span class='accordion-arrow' aria-hidden='true'></span></summary>"
+                + "<fieldset class='filter-choices'><legend class='sr-only'>" + label + "（複数選択可）</legend>"
+                + filterCheckbox(key, "", "すべて", selected.isEmpty());
+        for (Map.Entry<String, String> option : options.entrySet()) {
+            html += filterCheckbox(key, option.getKey(), option.getValue(), selected.contains(option.getKey()));
+        }
+        if (key.equals("deadlineFilter")) {
+            html += "<p class='filter-help'>一週間以内：今日から7日後まで。それ以降：8日後から。</p>";
+        } else if (options.isEmpty()) {
+            html += "<p class='filter-help'>登録済みの" + label + "はありません。</p>";
+        }
+        return html + "</fieldset></details>";
+    }
+
+    static String filterCheckbox(String key, String value, String label, boolean checked) {
+        return "<label class='filter-choice'><input type='checkbox' name='" + key + "' value='"
+                + escapeHtml(value) + "'" + (checked ? " checked" : "") + "><span>" + escapeHtml(label) + "</span></label>";
     }
 
     // ★ 登録先と変更先のパス（URLの末尾）を、決めた3種類から探します。
@@ -1260,47 +2156,9 @@ public class App {
         return ids;
     }
 
-    // ★ 絞り込みには、すべて・未設定・登録済み番号を使います。
-    static Map<Detail, String> readDetailFilters(String query) {
-        Map<Detail, String> filters = new LinkedHashMap<>();
-        for (Detail detail : Detail.values()) {
-            filters.put(detail, normalizedFilter(formValue(query, detail.filterKey())));
-        }
-        return filters;
-    }
-
-    // ★ 絞り込み条件をURLに付け足します。値は確認済みの番号かnoneだけです。
-    static String detailFilterQuery(Map<Detail, String> filters) {
-        String query = "";
-        for (Detail detail : Detail.values()) {
-            String selected = normalizedFilter(filters.getOrDefault(detail, ""));
-            if (!selected.isEmpty()) {
-                query += "&" + detail.filterKey() + "=" + selected;
-            }
-        }
-        return query;
-    }
-
-    // ★ フォームから送信した後も、現在の絞り込みを保持します。
-    static String detailFilterInputs(Map<Detail, String> filters) {
-        String html = "";
-        for (Detail detail : Detail.values()) {
-            html += "<input type='hidden' name='" + detail.filterKey() + "' value='"
-                    + normalizedFilter(filters.getOrDefault(detail, "")) + "'>";
-        }
-        return html;
-    }
-
     // ★ 選択肢の名前は重複登録せず、Todoがなくても残しておきます。
     static void addDetail(Detail detail, String name) throws IOException {
-        try (Connection connection = openDatabase();
-                PreparedStatement statement = connection.prepareStatement(
-                        "INSERT INTO " + detail.table + " (name) VALUES (?) ON CONFLICT(name) DO NOTHING")) {
-            statement.setString(1, name);
-            statement.executeUpdate();
-        } catch (SQLException e) {
-            throw new IOException(e);
-        }
+        if (!cleanClassificationName(name).isEmpty()) createClassification(classificationForKey(detail.key), name);
     }
 
     // ★ 場所・関係者・プロジェクトの名前を、それぞれ名前順に読み込みます。
@@ -1347,27 +2205,7 @@ public class App {
 
     // ★ Todo追加時と変更時に使う、未設定も選べる選択欄です。
     static String detailSelect(Detail detail, Map<Integer, String> options, int selected) {
-        String html = "<select name='" + detail.key + "'><option value='0'"
-                + (selected == 0 ? " selected" : "") + ">未設定</option>";
-        for (Map.Entry<Integer, String> option : options.entrySet()) {
-            html += "<option value='" + option.getKey() + "'" + (selected == option.getKey() ? " selected" : "")
-                    + ">" + escapeHtml(option.getValue()) + "</option>";
-        }
-        return html + "</select>";
-    }
-
-    // ★ 一覧を絞り込むための、項目名付きの選択欄です。
-    static String detailFilterSelect(Detail detail, Map<Integer, String> options, String selected) {
-        String html = "<label class='field-label' for='" + detail.key + "-filter'>" + detail.label
-                + "</label><select id='" + detail.key + "-filter' name='" + detail.filterKey()
-                + "' aria-label='表示する" + detail.label + "'><option value=''>すべて</option><option value='none'"
-                + (selected.equals("none") ? " selected" : "") + ">未設定</option>";
-        for (Map.Entry<Integer, String> option : options.entrySet()) {
-            html += "<option value='" + option.getKey() + "'"
-                    + (selected.equals(option.getKey().toString()) ? " selected" : "") + ">"
-                    + escapeHtml(option.getValue()) + "</option>";
-        }
-        return html + "</select>";
+        return classificationCombo(classificationForKey(detail.key), options, List.of(selected));
     }
 
     // ★ 同じ名前の入力欄をすべて読みます。チェック欄を複数選ぶと同じ名前で送られます。
@@ -1417,14 +2255,7 @@ public class App {
 
     // ★ 名前が同じタグは増やさず、登録済みのものを使います。
     static void addTag(String name) throws IOException {
-        try (Connection connection = openDatabase();
-                PreparedStatement statement = connection.prepareStatement(
-                        "INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING")) {
-            statement.setString(1, name);
-            statement.executeUpdate();
-        } catch (SQLException e) {
-            throw new IOException(e);
-        }
+        if (!cleanClassificationName(name).isEmpty()) createClassification(Classification.TAG, name);
     }
 
     // ★ 選択を全解除した場合も含め、1件のTodoのタグを入れ替えます。
@@ -1490,18 +2321,10 @@ public class App {
         }
     }
 
-    // ★ キー操作の特別な組み合わせが不要なチェック欄で、複数のタグを選べます。
-    static String tagCheckboxes(Map<Integer, String> tags, List<Integer> selected) {
-        String html = "<fieldset class='tag-options'><legend>タグ（複数選択可）</legend><div class='tag-choices'>";
-        if (tags.isEmpty()) {
-            html += "<span class='tag-hint'>左側の「タグを登録」から登録できます</span>";
-        }
-        for (Map.Entry<Integer, String> tag : tags.entrySet()) {
-            html += "<label class='tag-choice'><input type='checkbox' name='tag' value='" + tag.getKey() + "'"
-                    + (selected.contains(tag.getKey()) ? " checked" : "") + "><span>"
-                    + escapeHtml(tag.getValue()) + "</span></label>";
-        }
-        return html + "</div></fieldset>";
+    // ★ タグも同じ検索欄を使い、複数選択とチップでの解除に対応します。
+    static String tagPicker(Map<Integer, String> tags, List<Integer> selected) {
+        return "<div class='tag-picker'><span class='field-label'>タグ（複数選択可）</span>"
+                + classificationCombo(Classification.TAG, tags, selected) + "</div>";
     }
 
     // ★ 期限切れフォルダでは、設定されたタグだけを表示します。
@@ -1516,18 +2339,6 @@ public class App {
         return html + "</div>";
     }
 
-    // ★ 選んだタグが付いたTodo、またはタグなしのTodoを絞り込めます。
-    static String tagFilterSelect(Map<Integer, String> tags, String selected) {
-        String html = "<label class='field-label' for='tag-filter'>タグ</label>"
-                + "<select id='tag-filter' name='tagFilter' aria-label='表示するタグ'><option value=''>すべて</option>"
-                + "<option value='none'" + (selected.equals("none") ? " selected" : "") + ">タグなし</option>";
-        for (Map.Entry<Integer, String> tag : tags.entrySet()) {
-            html += "<option value='" + tag.getKey() + "'" + (selected.equals(tag.getKey().toString()) ? " selected" : "")
-                    + ">" + escapeHtml(tag.getValue()) + "</option>";
-        }
-        return html + "</select>";
-    }
-
     // ★ 入力した名前を、画面にそのまま表示できる形にします。
     static String escapeHtml(String value) {
         return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
@@ -1536,12 +2347,7 @@ public class App {
 
     // ★ 追加フォームと各Todoで共通のカテゴリ選択欄を作ります。
     static String genreSelect(Map<Integer, String> genres, int selected) {
-        String html = "<select name='genre'><option value='0'" + (selected == 0 ? " selected" : "") + ">未分類</option>";
-        for (Map.Entry<Integer, String> genre : genres.entrySet()) {
-            html += "<option value='" + genre.getKey() + "'" + (selected == genre.getKey() ? " selected" : "") + ">"
-                    + escapeHtml(genre.getValue()) + "</option>";
-        }
-        return html + "</select>";
+        return classificationCombo(Classification.CATEGORY, genres, List.of(selected));
     }
 
     // ★ 重要度は指定した3種類だけを受け付けます。
@@ -1575,14 +2381,7 @@ public class App {
 
     // ★ カテゴリ名は重複登録せず、空のカテゴリも一覧に残しておきます。
     static void addGenre(String name) throws IOException {
-        try (Connection connection = openDatabase();
-                PreparedStatement statement = connection
-                        .prepareStatement("INSERT INTO genres (name) VALUES (?) ON CONFLICT(name) DO NOTHING")) {
-            statement.setString(1, name);
-            statement.executeUpdate();
-        } catch (SQLException e) {
-            throw new IOException(e);
-        }
+        if (!cleanClassificationName(name).isEmpty()) createClassification(Classification.CATEGORY, name);
     }
 
     // ★ 登録済みカテゴリを名前順に読み込みます。
