@@ -54,8 +54,13 @@ public class App {
                 String title = formValue(body, "todo");
                 try {
                     int genreId = readGenreId(formValue(body, "genre"));
-                    if (!title.isEmpty() && (genreId == 0 || loadGenres().containsKey(genreId))) {
-                        addTodo(title, genreId);
+                    String priority = formValue(body, "priority");
+                    if (priority.isEmpty()) {
+                        priority = "中"; // ★ 重要度を送らない従来の追加操作にも対応します。
+                    }
+                    if (!title.isEmpty() && isValidPriority(priority)
+                            && (genreId == 0 || loadGenres().containsKey(genreId))) {
+                        addTodo(title, genreId, priority);
                     }
                 } catch (NumberFormatException e) {
                     // ★ 不正なジャンル番号では追加しません。
@@ -89,6 +94,23 @@ public class App {
                     int genreId = readGenreId(formValue(body, "genre"));
                     if (genreId == 0 || loadGenres().containsKey(genreId)) {
                         updateGenre(id, genreId);
+                    }
+                } catch (NumberFormatException e) {
+                    // ★ 不正な番号では変更しません。
+                }
+                exchange.getResponseHeaders().set("Location",
+                        listLocation(formValue(body, "filter"), formValue(body, "folder")));
+                exchange.sendResponseHeaders(303, -1);
+                exchange.close();
+                return;
+                // ★ Todoごとのフォームから重要度を変更します。
+            } else if (path.equals("/priority") && method.equals("POST")) {
+                String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                try {
+                    int id = Integer.parseInt(formValue(body, "id"));
+                    String priority = formValue(body, "priority");
+                    if (isValidPriority(priority)) {
+                        updatePriority(id, priority);
                     }
                 } catch (NumberFormatException e) {
                     // ★ 不正な番号では変更しません。
@@ -268,12 +290,13 @@ public class App {
         html += "</header>";
         if (!expiredFolder) {
             html += "<section class='add-section' aria-labelledby='add-heading'><h2 id='add-heading' class='small-heading'>Todoを追加</h2><form class='add-form' method='post' action='/add'><label class='field'><span class='field-label'>やること</span><input name='todo' placeholder='やることを入力'></label><label class='field'><span class='field-label'>ジャンル</span>"
-                    + genreSelect(genres, selectedGenre) + "</label>" + hiddenFilter
+                    + genreSelect(genres, selectedGenre) + "</label><label class='field'><span class='field-label'>重要度</span>"
+                    + prioritySelect("中") + "</label>" + hiddenFilter
                     + "<button class='button button-primary'>" + uiIcon("plus") + "追加</button></form></section>";
         }
         // ★ 並び替えボタンの操作はそのままに、選択状態を見分けられるようにします。
         html += "<section class='list-section" + (expiredFolder ? " archived-list" : "") + "' aria-labelledby='list-heading'><div class='list-toolbar'><h2 id='list-heading'>一覧</h2><div class='sort-control' aria-label='期限の並び順'><button type='button' data-sort='asc' aria-pressed='true' onclick='sortTodos(false)'>期限が近い順</button><button type='button' data-sort='desc' aria-pressed='false' onclick='sortTodos(true)'>期限が遠い順</button></div></div>";
-        html += "<div class='column-headings' aria-hidden='true'><span>やること</span><span>ジャンル</span><span>期限</span><span class='actions-heading'>操作</span></div><ul id='todo-list' class='todo-list'>";
+        html += "<div class='column-headings' aria-hidden='true'><span>やること</span><span>ジャンル</span><span>重要度</span><span>期限</span><span class='actions-heading'>操作</span></div><ul id='todo-list' class='todo-list'>";
         if (todos.isEmpty()) {
             html += "<li class='empty-state'>"
                     + (expiredFolder ? "期限切れのTodoはありません" : filter.isEmpty() ? "やることは、いまゼロです" : "このジャンルのTodoはありません")
@@ -288,6 +311,7 @@ public class App {
                     html += "<p class='task-note'>自動削除：" + LocalDate.parse(todo.getExpiredOn()).plusDays(30)
                             + "</p></div><span class='task-genre archived-value'>"
                             + escapeHtml(todo.getGenreId() == 0 ? "未分類" : todo.getGenreName())
+                            + "</span><span class='task-priority archived-value'>" + escapeHtml(todo.getPriority())
                             + "</span><span class='task-deadline archived-value'>" + escapeHtml(todo.getDeadline())
                             + "</span>";
                 } else {
@@ -295,6 +319,10 @@ public class App {
                             + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>ジャンル</span>"
                             + genreSelect(genres, todo.getGenreId())
                             + "</label><button class='save-button' aria-label='ジャンルを保存' title='ジャンルを保存'>保存</button></form>";
+                    html += "<form class='task-field task-priority' method='post' action='/priority' aria-label='重要度の変更'>"
+                            + hiddenId + hiddenFilter + "<label class='control-label'><span class='sr-only'>重要度</span>"
+                            + prioritySelect(todo.getPriority())
+                            + "</label><button class='save-button' aria-label='重要度を保存' title='重要度を保存'>保存</button></form>";
                     html += "<form class='task-field task-deadline' method='post' action='/deadline' aria-label='期限の変更'>"
                             + hiddenId + hiddenFilter
                             + "<label class='control-label'><span class='sr-only'>期限</span><input type='date' name='deadline' max='9999-12-31' value='"
@@ -386,7 +414,7 @@ public class App {
                 h1 { font-size: 30px; font-weight: 600; letter-spacing: -.035em; line-height: 1.4; }
                 .small-heading { margin-bottom: 14px; font-size: 14px; font-weight: 500; }
                 .add-section { margin-bottom: 48px; }
-                .add-form { display: grid; grid-template-columns: minmax(0, 1fr) 154px auto; align-items: end; gap: 12px; }
+                .add-form { display: grid; grid-template-columns: minmax(0, 1fr) 140px 100px auto; align-items: end; gap: 12px; }
                 .field { display: flex; min-width: 0; flex-direction: column; gap: 7px; }
                 .field-label { color: #718076; font-size: 12px; font-weight: 400; }
                 input, select { min-width: 0; min-height: 42px; padding: 8px 11px; border: 1px solid #DDE3DC; border-radius: 9px; background: var(--main); outline: none; }
@@ -405,7 +433,7 @@ public class App {
                 .sort-control button { min-height: 32px; padding: 5px 12px; border: 0; border-radius: 7px; background: transparent; color: #748078; font-size: 12px; }
                 .sort-control button:hover { background: #E9EEE8; color: var(--text); }
                 .sort-control button[aria-pressed='true'] { background: var(--main); color: var(--text); }
-                .column-headings, .task-row { display: grid; grid-template-columns: minmax(0, 1fr) 162px 198px 78px; gap: 16px; align-items: center; }
+                .column-headings, .task-row { display: grid; grid-template-columns: minmax(0, 1fr) 144px 100px 190px 78px; gap: 12px; align-items: center; }
                 .column-headings { padding: 0 0 11px; color: var(--muted); font-size: 11px; }
                 .actions-heading { text-align: right; }
                 .todo-list { list-style: none; padding: 0; border-top: 1px solid var(--line); }
@@ -419,7 +447,7 @@ public class App {
                 .save-button { min-height: 32px; flex: 0 0 36px; padding: 4px 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--main); color: #6A786D; font-size: 11px; }
                 .save-button:hover { background: var(--sidebar); color: var(--text); border-color: #D4DED2; }
                 .task-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
-                .archived-list .column-headings, .archived-list .task-row { grid-template-columns: minmax(0, 1fr) 130px 132px 148px; }
+                .archived-list .column-headings, .archived-list .task-row { grid-template-columns: minmax(0, 1fr) 130px 72px 132px 148px; }
                 .restore-form { margin: 0; display: flex; }
                 .restore-button { min-height: 32px; padding: 5px 10px; border: 1px solid #DDE3DC; border-radius: 8px; background: var(--main); color: #607D66; font-size: 12px; white-space: nowrap; }
                 .restore-button:hover { background: var(--sidebar); border-color: var(--selected); color: var(--text); }
@@ -431,17 +459,19 @@ public class App {
                 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
                 @media (max-width: 1100px) {
                     .main-pane { padding: 48px 28px 72px; }
-                    .column-headings, .task-row { gap: 10px; grid-template-columns: minmax(0, 1fr) 148px 183px 72px; }
+                    .column-headings, .task-row { gap: 10px; grid-template-columns: minmax(0, 1fr) 130px 96px 174px 72px; }
                 }
                 @media (max-width: 960px) {
                     .column-headings { display: none; }
-                    .task-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: 12px; }
-                    .archived-list .task-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-                    .task-title-box { grid-column: 1; grid-row: 1; }
-                    .task-actions { grid-column: 2; grid-row: 1; }
-                    .task-genre { grid-column: 1; grid-row: 2; }
-                    .task-deadline { grid-column: 2; grid-row: 2; }
-                    .add-form { grid-template-columns: minmax(0, 1fr) 120px; }
+                    .task-row { grid-template-columns: repeat(6, minmax(0, 1fr)); row-gap: 12px; }
+                    .archived-list .task-row { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+                    .task-title-box { grid-column: 1 / span 4; grid-row: 1; }
+                    .task-actions { grid-column: 5 / span 2; grid-row: 1; }
+                    .task-genre { grid-column: 1 / span 3; grid-row: 2; }
+                    .task-priority { grid-column: 4 / span 3; grid-row: 2; }
+                    .task-deadline { grid-column: 1 / -1; grid-row: 3; }
+                    .add-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+                    .add-form .field:first-child { grid-column: 1 / -1; }
                     .add-form .button { grid-column: 1 / -1; }
                 }
                 @media (max-width: 700px) {
@@ -483,11 +513,12 @@ public class App {
                     "CREATE TABLE IF NOT EXISTS genres (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)"); // ★
                                                                                                               // ジャンルを別の表に保存します。
             statement.executeUpdate(
-                    "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER, deadline TEXT, genre_id INTEGER, expired_on TEXT)");
+                    "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT, done INTEGER, deadline TEXT, genre_id INTEGER, expired_on TEXT, priority TEXT NOT NULL DEFAULT '中' CHECK (priority IN ('高','中','低')))");
             // ★ 以前の表に期限列がなければ、既存のTodoを残したまま追加します。
             boolean hasDeadline = false;
             boolean hasGenre = false;
             boolean hasExpiredOn = false;
+            boolean hasPriority = false;
             try (ResultSet columns = statement.executeQuery("PRAGMA table_info(todos)")) {
                 while (columns.next()) {
                     if (columns.getString("name").equals("deadline")) {
@@ -499,6 +530,9 @@ public class App {
                     if (columns.getString("name").equals("expired_on")) {
                         hasExpiredOn = true;
                     }
+                    if (columns.getString("name").equals("priority")) {
+                        hasPriority = true;
+                    }
                 }
             }
             if (!hasDeadline) {
@@ -509,6 +543,9 @@ public class App {
             }
             if (!hasExpiredOn) {
                 statement.executeUpdate("ALTER TABLE todos ADD COLUMN expired_on TEXT");
+            }
+            if (!hasPriority) {
+                statement.executeUpdate("ALTER TABLE todos ADD COLUMN priority TEXT NOT NULL DEFAULT '中' CHECK (priority IN ('高','中','低'))");
             }
         } catch (SQLException e) { // ★ SQLのエラーを受け止めます。
             throw new IOException(e); // ★ Webサーバー側へ入出力エラーとして伝えます。
@@ -555,15 +592,21 @@ public class App {
 
     // ★変更 TodoをINSERT文でデータベースに追加します。
     static void addTodo(String title, int genreId) throws IOException { // ★ タイトルとジャンルを保存します。
+        addTodo(title, genreId, "中");
+    }
+
+    // ★ 重要度も同じTodoの行へ保存します。
+    static void addTodo(String title, int genreId, String priority) throws IOException {
         try (Connection connection = DriverManager.getConnection(DB_URL);
                 PreparedStatement statement = connection
-                        .prepareStatement("INSERT INTO todos (title, done, genre_id) VALUES (?, 0, ?)")) {
+                        .prepareStatement("INSERT INTO todos (title, done, genre_id, priority) VALUES (?, 0, ?, ?)")) {
             statement.setString(1, title); // ★ 1つ目の ? にタイトルを入れます。
             if (genreId == 0) {
                 statement.setNull(2, java.sql.Types.INTEGER);
             } else {
                 statement.setInt(2, genreId);
             }
+            statement.setString(3, priority);
             statement.executeUpdate(); // ★ 新しいTodoを保存します。
         } catch (SQLException e) { // ★ SQLのエラーを受け止めます。
             throw new IOException(e); // ★ Webサーバー側へ入出力エラーとして伝えます。
@@ -622,7 +665,7 @@ public class App {
         maintainExpiredTodos();
         filter = normalizedFilter(filter);
         List<Todo> todos = new ArrayList<>(); // ★ 読み込んだTodoを入れる一覧です。
-        String sql = "SELECT t.id, t.title, t.done, t.deadline, t.genre_id, t.expired_on, g.name AS genre_name FROM todos t LEFT JOIN genres g ON t.genre_id = g.id WHERE 1 = 1";
+        String sql = "SELECT t.id, t.title, t.done, t.deadline, t.genre_id, t.expired_on, t.priority, g.name AS genre_name FROM todos t LEFT JOIN genres g ON t.genre_id = g.id WHERE 1 = 1";
         if (folder.equals("expired")) {
             sql += " AND t.expired_on IS NOT NULL";
         } else if (!folder.equals("all")) {
@@ -646,6 +689,7 @@ public class App {
                     todo.setDeadline(result.getString("deadline")); // ★ 保存した期限も読み戻します。
                     todo.setExpiredOn(result.getString("expired_on"));
                     todo.setGenre(result.getInt("genre_id"), result.getString("genre_name"));
+                    todo.setPriority(result.getString("priority"));
                     if (result.getInt("done") == 1) { // ★ 完了状態が1かを調べます。
                         todo.setDone(true); // ★ 完了済みとして設定します。
                     } // ★ 完了状態の確認を終えます。
@@ -726,6 +770,35 @@ public class App {
                     + escapeHtml(genre.getValue()) + "</option>";
         }
         return html + "</select>";
+    }
+
+    // ★ 重要度は指定した3種類だけを受け付けます。
+    static boolean isValidPriority(String priority) {
+        return priority.equals("高") || priority.equals("中") || priority.equals("低");
+    }
+
+    // ★ 追加時と変更時に共通の選択欄を使います。
+    static String prioritySelect(String selected) {
+        String html = "<select name='priority' aria-label='重要度'>";
+        for (String priority : new String[] { "高", "中", "低" }) {
+            html += "<option value='" + priority + "'" + (priority.equals(selected) ? " selected" : "") + ">" + priority + "</option>";
+        }
+        return html + "</select>";
+    }
+
+    // ★ 重要度だけを書き換え、期限・ジャンル・完了状態は保持します。
+    static void updatePriority(int id, String priority) throws IOException {
+        if (!isValidPriority(priority)) {
+            return;
+        }
+        try (Connection connection = DriverManager.getConnection(DB_URL); PreparedStatement statement = connection.prepareStatement(
+                "UPDATE todos SET priority = ? WHERE id = ? AND expired_on IS NULL")) {
+            statement.setString(1, priority);
+            statement.setInt(2, id);
+            statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new IOException(e);
+        }
     }
 
     // ★ ジャンル名は重複登録せず、空のジャンルも一覧に残しておきます。
@@ -859,6 +932,8 @@ class Todo {
     private String deadline = "";
     // ★ 期限切れフォルダへ移した日を保存します。
     private String expiredOn = "";
+    // ★ 重要度は初期値を「中」にします。
+    private String priority = "中";
     // ★ ジャンルの番号と表示名を持ち、番号0は未分類を表します。
     private int genreId;
     private String genreName = "";
@@ -906,6 +981,14 @@ class Todo {
 
     void setExpiredOn(String expiredOn) {
         this.expiredOn = expiredOn == null ? "" : expiredOn;
+    }
+
+    String getPriority() {
+        return priority;
+    }
+
+    void setPriority(String priority) {
+        this.priority = priority == null ? "中" : priority;
     }
 
     // ★ Todoに設定したジャンルを読み出します。
